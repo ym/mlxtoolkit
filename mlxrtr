@@ -1,0 +1,2725 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+no autovivification;
+
+use Storable qw(dclone);
+use File::Basename qw(dirname);
+
+my $_write_mode = 0;
+
+my $max_ifname_len = 15;
+
+my $our_iface = qr/enp\d+s\d+np\d+\S*|bond\S+|switch|vlan\S+|vrf\S+|lo\S+/;
+my @ipv6_linklocal = qw( fe80::/10 );
+my $route_proto = 'static';
+
+my $port_prefix;
+
+my $_curfilehandle;
+my $_curfilename;
+
+sub max {
+	my $m;
+	foreach (@_) {
+		defined $_ or next;
+		if (defined $m) {
+			$m < $_ and $m = $_;
+		} else {
+			$m = $_;
+		}
+	}
+	return $m;
+}
+
+sub find_port_prefix {
+	foreach my $p (glob '/sys/class/net/enp*s*np*') {
+		$p =~ s!.*/!!;
+		$p =~ s/np.*/np/;
+		if (defined $port_prefix) {
+			$port_prefix eq $p or die("different port prefixes found: $port_prefix, $p");
+		} else {
+			$port_prefix = $p;
+		}
+	}
+
+	defined $port_prefix or die('can not figure out port prefix');
+}
+
+sub in_range {
+	my ($a, $min, $max) = @_;
+	return ($a >= $min and $a <= $max);
+}
+
+#sub is_ipv6 {
+#	my ($a) = @_;
+#	return ($a =~ m!^[0-9a-fA-F:]*:[0-9a-fA-F:\./]*$!)
+#}
+
+sub ip_ver {
+	my ($a) = @_;
+	$a =~ m!^\d+\.\d+\.\d+\.\d+(/\d+)?! and return 'ipv4';
+	$a =~ m!^[0-9a-fA-F:]*:[0-9a-fA-F:]*:[0-9a-fA-F:\.]*(/\d+)?$! and return 'ipv6';
+	return '';
+}
+
+sub parse_ip4a {
+	my ($a) = @_;
+	$a =~ /^(?<o1>\d+)\.(?<o2>\d+)\.(?<o3>\d+)\.(?<o4>\d+)$/ or return ();
+	my @b = map { int($+{"o$_"}) } (1..4);
+	foreach my $o (@b) { in_range($o, 0, 255) or return (); }
+	return @b;
+}
+
+sub parse_prefix4 {
+	my ($a, $alwaysmask) = @_;
+	$alwaysmask //= 1;
+	$a eq 'default' and return '0.0.0.0/0';
+	$a =~ /^(?<ip>\d+\.\d+\.\d+\.\d+)(\/(?<mask>\d+))?$/ or return undef;
+	my ($ip, $m) = ($+{'ip'}, $+{'mask'} // '');
+	my @b = parse_ip4a($ip);
+	@b or return undef;
+	my $mask = '';
+	if ($m ne '') {
+		in_range($m, 0, 32) or return undef;
+		($m < 32 or $alwaysmask) and $mask = "/$m";
+	} elsif ($alwaysmask) {
+		$mask = '/32';
+	}
+	return join('.', @b).$mask;
+}
+
+sub ipbit4 {
+	my ($a) = @_;
+	my @b = parse_ip4a($a);
+	@b or return undef;
+	return join('', map { sprintf "%08b", $_; } @b);
+}
+
+sub parse_ip6a {
+	my ($a) = @_;
+
+	# convert ipv4-mapped address
+	if ($a =~ s/:(?<ip>\d+\.\d+\.\d+\.\d+)$//) {
+		my @b = parse_ip4a($+{'ip'});
+		@b or return ();
+		$a .= ':'.sprintf("%02x", $b[0]).sprintf("%02x", $b[1]).
+		      ':'.sprintf("%02x", $b[2]).sprintf("%02x", $b[3]);
+	}
+	# expand ::
+	if ($a =~ /^(?<left>.*)::(?<right>.*)$/) {
+		my @l = split(/:/, $+{'left'}, -1);
+		my @r = split(/:/, $+{'right'}, -1);
+		my $nl = @l;
+		my $nr = @r;
+		($nl + $nr) < 8 or return ();
+		$a = join(':', @l, map({ '0' } (1..(8-$nl-$nr))), @r);
+	}
+	# check syntax
+	my @b = split(/:/, $a, -1);
+	@b == 8 or return ();
+	foreach my $s (@b) {
+		$s =~ /^[0-9a-fA-F]{1,4}$/ or return ();
+	}
+	@b = map { hex($_) } @b;
+
+	return @b;
+}
+
+sub parse_prefix6 {
+	my ($a, $alwaysmask) = @_;
+	$alwaysmask //= 1;
+	$a eq 'default' and return '::/0';
+	my $mask = '';
+
+	# check mask
+	if ($a =~ s!/(?<mask>\d+)$!!) {
+		my $m = int($+{'mask'});
+		in_range($m, 0, 128) or return undef;
+		($m < 128 or $alwaysmask) and $mask = "/$m";
+	} elsif ($alwaysmask) {
+		$mask = '/128';
+	}
+
+	my @b = parse_ip6a($a);
+	@b or return undef;
+
+	@b = map { sprintf("%x", $_) } @b;
+
+	# find longest zero sequence
+	my ($seq_max_start, $seq_max_len, $seq_start, $seq_len);
+	$seq_max_len = 0;
+	$seq_start = '';
+	foreach my $p ((0..7)) {
+		if ($b[$p] eq '0') {
+			if ($seq_start eq '') {
+				$seq_start = $p;
+				$seq_len = 1;
+			} else {
+				if (++$seq_len >= $seq_max_len) {
+					$seq_max_len = $seq_len;
+					$seq_max_start = $seq_start;
+				}
+			}
+		} else {
+			$seq_start = '';
+			$seq_len = 0;
+		}
+	}
+	# replace zero sequence with ::
+	if ($seq_max_len > 1) {
+		$a = join(':', @b[0 .. ($seq_max_start-1)]).'::'.join(':', @b[($seq_max_start+$seq_max_len) .. 7]);
+	}
+	# address is ready
+	return "$a$mask";
+}
+
+sub ipbit6 {
+	my ($a) = @_;
+	my @b = parse_ip6a($a);
+	@b or return undef;
+	return join('', map { sprintf "%016b", $_; } @b);
+}
+
+sub parse_prefix {
+	my ($a, @opt) = @_;
+	my $v = ip_ver($a);
+	if ($v eq 'ipv4') {
+		return parse_prefix4($a, @opt);
+	} elsif ($v eq 'ipv6') {
+		return parse_prefix6($a, @opt);
+	} else {
+		return undef;
+	}
+}
+
+sub next_token {
+	my ($s) = @_;
+	$s =~ s/^\s+//;
+	if ($s eq '') {
+		return ('', '');
+	} elsif ($s =~ /^(?<word>[-_,\/])(?<tail>.*)$/) {
+		return ($+{'word'}, $+{'tail'});
+	} elsif ($s =~ /^(?<word>[^-_,\/\s]+)(?<tail>.*)$/) {
+		return ($+{'word'}, $+{'tail'});
+	} else {
+		return (undef, $s);
+	}
+}
+
+sub next_word {
+	my ($s) = @_;
+	$s =~ s/^\s+//;
+	if ($s eq '') {
+		return ('', '');
+	} elsif ($s =~ /^(?<word>,)(?<tail>.*)$/) {
+		return ($+{'word'}, $+{'tail'});
+	} elsif ($s =~ /^(?<word>[^,\s]+)(?<tail>.*)$/) {
+		return ($+{'word'}, $+{'tail'});
+	} else {
+		return (undef, $s);
+	}
+}
+
+sub next_nonspace {
+	my ($s) = @_;
+	$s =~ s/^\s+//;
+	if ($s eq '') {
+		return ('', '');
+	} elsif ($s =~ /^(?<word>\S+)(?<tail>.*)$/) {
+		return ($+{'word'}, $+{'tail'});
+	}
+	return (undef, $s);
+}
+
+sub next_uint {
+	my ($s0) = @_;
+	my ($w, $s) = next_token($s0);
+	$w =~ /^\d+$/ or return (undef, $s0);
+	return (int($w), $s);
+}
+
+sub next_vlan {
+	my ($s0) = @_;
+	my ($w, $s) = next_uint($s0);
+	defined $w and $w > 0 and $w < 4096 or return (undef, $s0);
+	return ($w, $s);
+}
+
+sub run_tool {
+	my ($bin, @a) = @_;
+	my $opt = "@a";
+	my $tool = $bin;
+	$tool =~ s!.*/!!; # tool name only
+	my $rocmd = 0;
+	if ($opt =~ /^(-\S+\s+)*\S+\s+show(\s|$)/) {
+		$rocmd = 1;
+	} elsif ("$tool $opt" =~ /sysctl\s+-[benNq]*[aAX]/) {
+		$rocmd = 1;
+		$opt .= ' 2>/dev/null';
+	}
+	if ($rocmd) {
+		my @res = `$bin $opt`;
+		$? and die("run $tool failed");
+		return @res;
+	} elsif ($_write_mode) {
+		print STDERR "$tool $opt\n";
+		my @res = `$bin $opt`;
+		$? and die("run $tool failed");
+		return @res;
+	} else {
+		print "$bin $opt\n";
+	}
+}
+
+sub ip {
+	return run_tool('/root/bin/ip', @_);
+}
+
+sub bridge {
+	return run_tool('/root/bin/bridge', @_);
+}
+
+sub tc {
+	return run_tool('/root/bin/tc', @_);
+}
+
+sub devlink {
+	return run_tool('devlink', @_);
+}
+
+sub sysctl {
+	return run_tool('sysctl', @_);
+}
+
+sub cmp_generic {
+	my ($a, $b) = @_;
+	my $ra = ref($a);
+	$ra ne ref($b) and return 0;
+	if ($ra eq '') {
+		return ($a eq $b);
+	} elsif ($ra eq 'ARRAY') {
+		my @aa = @$a;
+		my @ab = @$b;
+		scalar @aa != scalar @ab and return 0;
+		while (@aa > 0 and @ab > 0) {
+			my $ea = shift @aa;
+			my $eb = shift @ab;
+			cmp_generic($ea, $eb) or return 0;
+		}
+		return 1;
+	} elsif ($ra eq 'HASH') {
+		my @ka = sort keys %$a;
+		my @kb = sort keys %$b;
+		cmp_generic(\@ka, \@kb) or return 0;
+		foreach my $k (@ka) {
+			cmp_generic($a->{$k}, $b->{$k}) or return 0;
+		}
+		return 1;
+	} else {
+		die("cmp_generic: unsupported ref: $ra");
+	}
+}
+
+sub cmp_set {
+	my ($a, $b) = @_;
+	ref($a) eq 'HASH' or return 0;
+	ref($b) eq 'HASH' or return 0;
+	my @ka = sort keys %$a;
+	my @kb = sort keys %$b;
+	return cmp_generic(\@ka, \@kb);
+}
+
+sub array2set {
+	my ($a) = @_;
+	my $r = {};
+	foreach (@$a) { $r->{$_} = 1; }
+	return $r;
+}
+
+sub hash_keys {
+	my ($a) = @_;
+	ref($a) eq 'HASH' or return undef;
+	return array2set([keys %$a]);
+}
+
+sub set_union {
+	my @ss = @_;
+	my $r = {};
+	foreach my $s (@ss) {
+		foreach (keys %$s) { $r->{$_} = 1; }
+	}
+	return $r;
+}
+
+sub set_sub {
+	my ($a, $b) = @_;
+	my $r = {};
+	foreach my $v (keys %$a) {
+		defined $b->{$v} and next;
+		$r->{$v} = 1;
+	}
+	return $r;
+}
+
+sub set_intersect {
+	my ($a, $b) = @_;
+	my $r = {};
+	foreach my $v (keys %$a) {
+		defined $b->{$v} or next;
+		$r->{$v} = 1;
+	}
+	return $r;
+}
+
+sub set_diff {
+	my ($a, $b) = @_;
+	my ($ao, $ab, $bo);
+	$ao = set_sub($a, $b);
+	$bo = set_sub($b, $a);
+	$ab = set_sub($a, $ao);
+	return ($ao, $ab, $bo);
+}
+
+sub hash_diff {
+	my ($a, $b) = @_;
+	ref($a) eq 'HASH' or return undef;
+	ref($b) eq 'HASH' or return undef;
+	my ($del, $add, $c);
+	($del, $c, $add) = set_diff(hash_keys($a), hash_keys($b));
+	foreach my $k (keys %$c) {
+		cmp_generic($a->{$k}, $b->{$k}) and next;
+		$del->{$k} = 1;
+		$add->{$k} = 1;
+	}
+
+	return ($del, $add);
+}
+
+sub hash_empty {
+	my ($a) = @_;
+	defined $a or return 1;
+	ref($a) eq 'HASH' or return undef;
+	(keys %$a) == 0 and return 1;
+	return 0;
+}
+
+sub check_name {
+	my ($s) = @_;
+	$s =~ /^[-_a-zA-Z0-9]+$/
+	and $s =~ /^[a-zA-Z0-9]/
+	and $s =~ /[a-zA-Z0-9]$/
+	or return undef;
+	return $s;
+}
+
+sub iface_with_type {
+	my ($t, $n) = @_;
+	return "$t $n";
+}
+
+sub iface2dev {
+	my ($iface) = @_;
+
+	($iface eq 'switch') and return 'switch';
+
+	$iface =~ /^(?<type>\S+) (?<name>\S+)$/ or die("bad interface \"$iface\"");
+	my ($t, $n) = ($+{'type'}, $+{'name'});
+	my $port;
+
+	$t eq 'raw' and return $n;
+
+	$t eq 'loopback' and $t = 'loop';
+
+	if ($t eq 'port') {
+		if ($n =~ m!^(?<port>\d+)\s*/\s*(?<sub>\d+)$!) {
+			$port = $port_prefix.$+{'port'}.'s'.$+{'sub'};
+		} elsif ($n =~ /^\d+$/) {
+			$port = $port_prefix.$n;
+		} else {
+			die("bad physical port name: $n");
+		}
+	} elsif ($t eq 'vlan') {
+		if ($n =~ /^\d+$/) {
+			$port = "vlan$n";
+		} else {
+			die("bad vlan name: $n");
+		}
+	} else {
+		my $j = '';
+		if ($n =~ /^\d/) {
+			$j = '';
+		} elsif ($t eq 'vrf') {
+			$j = '-';
+		} else {
+			$j = '_';
+		}
+		$port = "$t$j$n";
+	}
+
+	length($port) > $max_ifname_len and die("device name too long: $port");
+
+	return $port;
+}
+
+sub next_iface {
+	my ($s0) = @_;
+	my ($w, $s) = next_word($s0);
+	$w =~ /^(?<type>bond|lo(op(back)?)?|port|vlan|vrf)((?<dname>\d\S*)|[-_](?<name>\S+))?$/ or return (undef, undef, $s0);
+	my $t = $+{'type'};
+	my $n = $+{'dname'} // $+{'name'};
+	$t =~ /^lo/ and $t = 'loopback';
+
+	if (not defined $n) {
+		($n, $s) = next_word($s);
+	}
+	($n // '') eq '' and die("Can not parse interface name in: $s0");
+
+	my $port;
+	if ($t =~ /^(bond|loopback|vrf)$/) { 
+		$n = check_name($n);
+		defined $n or die("No valid name for interface type $t in: $s0");
+		$port = iface_with_type($t, $n);
+	} elsif ($t eq 'vlan') {
+		my $x;
+		($n, $x) = next_vlan($n);
+		defined $n or die("Bad vlan id in: $s0");
+		$port = iface_with_type($t, $n);
+	} elsif ($t eq 'port') {
+		my $sub;
+		if ($n =~ m!^(?<port>\d+)(?<sub>/\d+)?$!) {
+			$n = $+{'port'};
+			$sub = $+{'sub'} // '';
+		} else {
+			die("Bad port number in: $s0");
+		}
+		$port = iface_with_type($t, "$n$sub");
+	} else {
+		die("oops");
+	}
+	return ($port, $t, $s);
+}
+
+sub glob_files {
+	my ($s) = @_;
+	if ($s =~ m!^/!) {
+		# keep absolute path as is
+	} elsif ($_curfilename eq '-') {
+		$s =~ m!^\./! or $s = "./$s";
+	} else {
+		$s = dirname($_curfilename)."/$s";
+	}
+	return glob($s);
+}
+
+sub parse_global_section {
+	my ($conf, $iface, $l) = @_;
+
+	my ($op, $s) = next_word($l);
+	$op //= '';
+
+	if ($op eq 'include') {
+		# get next files
+		while ($s ne '') {
+			($op, $s) = next_nonspace($s);
+			my @a = glob_files($op);
+			push @ARGV, @a;
+		}
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub conf_set_iface_master {
+	my ($conf, $iface, $master) = @_;
+	$conf->{'iface'}{$iface}{'master'} //= $master;
+	$conf->{'iface'}{$iface}{'master'} eq $master or die("$iface already have master, can not change to $master");
+	# add master interface stub
+	$conf->{'iface'}{$master} //= {};
+	return 1;
+}
+
+sub conf_add_iface_vlan {
+	my ($conf, $iface, $vlan, $type) = @_;
+	if ($type eq 'native') {
+		(keys %{$conf->{'switch'}{$iface}{'native'} // {}}) > 0 and die("native vlan for $iface is already defined");
+		$conf->{'switch'}{$iface}{'native'}{$vlan} = 1;
+	} elsif ($type eq 'tag') {
+		defined $conf->{'switch'}{$iface}{'tag'}{$vlan} and die("vlan already defined on the interface");
+		$conf->{'switch'}{$iface}{'tag'}{$vlan} = 1;
+	}
+	conf_set_iface_master($conf, $iface, 'switch');
+	return 1;
+}
+
+sub parse_iface_option {
+	my ($conf, $iface, $l) = @_;
+	my ($w, $s) = next_token($l);
+	$w eq 'down' or return 0;
+	($w, $s) = next_token($s);
+	$s eq '' and ($w // '') eq '' or die("bad down directive: $l");
+	defined $conf->{'iface'}{$iface}{'down'} and die("$iface is already down at: $l");
+	$conf->{'iface'}{$iface}{'down'} = 1;
+	return 1;
+}
+
+sub parse_vlan_option {
+	my ($conf, $iface, $l) = @_;
+	my ($w, $s) = next_token($l);
+
+	$w eq 'vlan' or return 0;
+
+	($w, $s) = next_token($s);
+
+	if ($w eq 'native') {
+		($w, $s) = next_vlan($s);
+		$s eq '' and defined $w or die("bad native vlan: $l");
+		conf_add_iface_vlan($conf, $iface, $w, 'native');
+		return 1;
+	} elsif ($w eq 'tag') {
+		$w = ',';
+		while (($w // '') eq ',') {
+			($w, $s) = next_vlan($s);
+			defined $w or die("bad vlan list: $l");
+			conf_add_iface_vlan($conf, $iface, $w, 'tag');
+			($w, $s) = next_token($s);
+		}
+		defined $w and $w eq '' and $s eq '' or die("bad vlan list: $l");
+		return 1;
+	} else {
+		die("bad vlan directive: $l");
+	}
+}
+
+sub parse_ip_option {
+	my ($conf, $iface, $l) = @_;
+	my ($w, $s) = next_token($l);
+
+	if ($w eq 'vrf') {
+		($w, $s) = next_word($s);
+		$s eq '' and defined $w and $w ne '' or die("bad vrf directive: $l");
+		$w = check_name($w) or die("bad vrf name: $l");
+		my $vrf = iface_with_type('vrf', "$w");
+		conf_set_iface_master($conf, $iface, $vrf);
+		$conf->{'vrf'}{$vrf} //= {};
+		$conf->{'iface'}{$iface} //= {};
+		$conf->{'addr'}{$iface} //= {};
+		return 1;
+	} elsif ($w eq 'ip') {
+		$conf->{'iface'}{$iface} //= {};
+		$conf->{'addr'}{$iface} //= {};
+		$s eq '' and return 1; # no ip configured
+		$w = ',';
+		while ($w eq ',') {
+			($w, $s) = next_word($s);
+			$w = parse_prefix($w);
+			($w // '') eq '' and die("bad ip list: $l");
+			my $ver = ip_ver($w);
+			defined $conf->{'addr'}{$iface}{$ver}{$w} and die("$w is already defined for $iface in: $l");
+			$conf->{'addr'}{$iface}{$ver}{$w} = 1;
+			($w, $s) = next_token($s);
+		}
+		defined $w and $w eq '' and $s eq '' or die("bad ip list: $l");
+		
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub parse_bond_option {
+	my ($conf, $iface, $l) = @_;
+	my ($w, $s) = next_token($l);
+
+	if ($w eq 'bond') {
+		($w, $s) = next_word($s);
+		$w = check_name($w);
+		defined $w or die("no valid name for bond in: $l");
+		$s eq '' or die("bad bond directive: $l");
+		my $bond = "bond $w";
+		conf_set_iface_master($conf, $iface, $bond);
+		$conf->{'bond'}{$bond} //= {};
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub parse_bond_section {
+	my ($conf, $iface, $l) = @_;
+
+	$conf->{'bond'}{$iface} //= {};
+	$conf->{'iface'}{$iface} //= {};
+
+	parse_iface_option($conf, $iface, $l) and return 1;
+	parse_vlan_option($conf, $iface, $l) and return 1;
+	parse_ip_option($conf, $iface, $l) and return 1;
+
+	my ($op, $s) = next_word($l);
+	$op //= '';
+
+	if ($op eq 'lacp_rate') {
+		($op, $s) = next_token($s);
+		$op =~ /^(fast|slow)$/ or die("Bad lacp_rate '$op' in: $l");
+		my $w;
+		($w, $s) = next_token($s);
+		$w eq '' or die("Bad lacp_rate directive: $l");
+		defined $conf->{'bond'}{$iface}{'lacp_rate'} and die("lacp_rate alredy defined for $iface in: $l");
+		$conf->{'bond'}{$iface}{'lacp_rate'} = $op;
+		return 1;
+	} elsif ($op eq 'min_links') {
+		($op, $s) = next_token($s);
+		$op =~ /^[1-9]\d*$/ or die("Bad min_links value '$op' in: $l");
+		my $w;
+		($w, $s) = next_token($s);
+		$w eq '' or die("Bad min_links directive: $l");
+		defined $conf->{'bond'}{$iface}{'min_links'} and die("min_links alredy defined for $iface in: $l");
+		$conf->{'bond'}{$iface}{'min_links'} = $op;
+		return 1;
+	} elsif ($op =~ /^slaves?$/) {
+		my $w = ',';
+		while ($w eq ',') {
+			my $t;
+			($op, $t, $s) = next_iface($s);
+			defined $op or die("Can not parse next interface in: $l");
+			$t eq 'port' or die("Only port interface slaves are allowed in bond: $l");
+			if ($op ne '') {
+				conf_set_iface_master($conf, $op, $iface)
+			}
+			($w, $s) = next_token($s);
+		}
+		$w eq '' or die("Bad interface list: $l");
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub parse_loopback_section {
+	my ($conf, $iface, $l) = @_;
+
+	$conf->{'iface'}{$iface} //= {};
+
+	parse_iface_option($conf, $iface, $l) and return 1;
+	parse_ip_option($conf, $iface, $l) and return 1;
+
+	return 0;
+}
+
+sub parse_port_section {
+	my ($conf, $iface, $l) = @_;
+
+	$conf->{'iface'}{$iface} //= {};
+
+	parse_iface_option($conf, $iface, $l) and return 1;
+	parse_bond_option($conf, $iface, $l) and return 1;
+	parse_vlan_option($conf, $iface, $l) and return 1;
+	parse_ip_option($conf, $iface, $l) and return 1;
+
+	my ($op, $s) = next_token($l);
+	$op //= '';
+
+	if ($op eq 'split') {
+		$iface =~ m!/\d+$! and die("can not split subinterface $iface at: $l");
+		($op, $s) = next_uint($s);
+		defined $op and $op > 0 or die("bad split directive: $l");
+		defined $conf->{'split'}{$iface} and die("interface $iface is already split at: $l");
+		$conf->{'split'}{$iface} = $op;
+		$s eq '' or die("bad split directive: $l");
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub parse_vlan_section {
+	my ($conf, $iface, $l) = @_;
+
+	# do not create interface for vlan by default
+	#$conf->{'iface'}{$iface} //= {};
+
+	parse_iface_option($conf, $iface, $l) and return 1;
+	parse_ip_option($conf, $iface, $l) and return 1;
+
+	my ($op, $s) = next_token($l);
+	$op //= '';
+
+	$iface =~ /^vlan (?<id>\d+)$/ or die("oops vlan");
+	my $vlan = $+{'id'};
+
+	if ($op =~ /^(native|tag)$/) {
+		my $type = $op;
+		my $w = ',';
+		while ($w eq ',') {
+			my $t;
+			($op, $t, $s) = next_iface($s);
+			defined $op or die("Can not parse next interface in: $l");
+			$t =~ /^(port|bond)$/ or die("Only port or bond interface are allowed in vlan: $l");
+			if ($op ne '') {
+				conf_add_iface_vlan($conf, $op, $vlan, $type)
+			}
+			($w, $s) = next_token($s);
+		}
+		$w eq '' or die("Bad interface list: $l");
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub parse_route_params {
+	my ($l) = @_;
+	my $w;
+	my $route = {};
+	my $s = $l;
+	my $ver;
+
+	($w, $s) = next_word($s);
+	$ver = ip_ver($w);
+	$w = parse_prefix($w);
+	defined $w or die("bad route prefix in: $l");
+	$route->{'prefix'} = $w;
+	$route->{'version'} = $ver;
+
+	while ($s ne '') {
+		($w, $s) = next_token($s);
+		if ($w eq 'metric') {
+			defined $route->{'metric'} and die("metric defined more than once: $l");
+			($w, $s) = next_uint($s);
+			defined $w and $w < 2**32 or die("bad metric in: $l");
+			$w == 0 and $ver eq 'ipv6' and die("metric 0 is not allowed with ipv6: $l");
+			$route->{'metric'} = $w;
+		} elsif ($w eq 'tos') {
+			defined $route->{'tos'} and die("tos defined more than once: $l");
+			($w, $s) = next_token($s);
+			defined $w and $w =~ /^0[xX][0-9a-fA-F]{1,2}$/ or die("bad tos in: $l");
+			$route->{'tos'} = hex($w);
+		} elsif ($w eq 'via') {
+			defined $route->{'via'} and die("via defined more than once: $l");
+			defined $route->{'blackhole'} and die("via defined with blackhole: $l");
+			($w, $s) = next_word($s);
+			my $vvia = ip_ver($w);
+			my $w = parse_prefix($w, 0);
+			defined $w and $w !~ m!/! or die("bad via address in: $l");
+			$vvia ne $ver and die("address version mistmatch in: $l");
+			$route->{'via'} = $w;
+		} elsif ($w eq 'dev') {
+			defined $route->{'dev'} and die("dev defined more than once: $l");
+			defined $route->{'blackhole'} and die("dev defined with blackhole: $l");
+			my $iftype;
+			($w, $iftype, $s) = next_iface($s);
+			defined $w or die("bad device in: $l");
+			$iftype =~ /^(loopback|vrf)$/ and die("bad device type in route: $l");
+			$route->{'dev'} = $w;
+		} elsif ($w eq 'weight') {
+			defined $route->{'weight'} and die("weight defined more than once: $l");
+			($w, $s) = next_uint($s);
+			defined $w and $w < 64 or die("bad weight in: $l");
+			$route->{'weight'} = $w;
+		} elsif ($w eq 'blackhole') {
+			defined $route->{'via'} and die("via defined with blackhole: $l");
+			defined $route->{'dev'} and die("dev defined with blackhole: $l");
+			$route->{'blackhole'} = 1;
+		} else {
+			die("bad route definition: $l");
+		}
+	}
+	defined $route->{'prefix'} or die("prefix not defined for route: $l");
+	defined $route->{'blackhole'} or defined $route->{'via'} or defined $route->{'dev'} or die("route without destination in: $l");
+	if ($ver eq 'ipv4') {
+		$route->{'metric'} //= 0;
+	} else {
+		$route->{'metric'} //= 1;
+	}
+	$route->{'tos'} //= 0;
+	$route->{'weight'} //= 1;
+	return $route;
+}
+
+sub parse_vrf_section {
+	my ($conf, $iface, $l) = @_;
+
+	$conf->{'vrf'}{$iface} //= {};
+	$conf->{'iface'}{$iface} //= {};
+
+	parse_iface_option($conf, $iface, $l) and return 1;
+
+	my ($op, $s) = next_token($l);
+	$op //= '';
+	if ($op eq 'table') {
+		($op, $s) = next_uint($s);
+		$s eq '' and defined $op and $op > 0 and $op < 253 or die("bad table directive: $l");
+		$conf->{'vrf'}{$iface}{'table'} = $op;
+		return 1;
+	} elsif ($op eq 'route') {
+		my $route = parse_route_params($s);
+		my $key = join(' ', $route->{'prefix'}, $route->{'metric'}, $route->{'tos'});
+		my $ver = $route->{'version'};
+		delete $route->{'prefix'};
+		delete $route->{'metric'};
+		delete $route->{'tos'};
+		delete $route->{'version'};
+		push @{$conf->{'vrf'}{$iface}{'route_tmp'}{$ver}{$key}}, $route;
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+my $section_parser = {
+	'global' => \&parse_global_section,
+	'bond' => \&parse_bond_section,
+	'loopback' => \&parse_loopback_section,
+	'port' => \&parse_port_section,
+	'vlan' => \&parse_vlan_section,
+	'vrf' => \&parse_vrf_section,
+};
+
+sub parse_section {
+	my ($conf, $s) = @_;
+	if ($s eq 'global') {
+		return ($s, $s);
+	} else {
+		my ($port, $type);
+		($port, $type, $s) = next_iface($s);
+		$s eq '' and defined $port and defined $type or return undef;
+		# make interfaces stub
+		$port =~ /^vlan / or $conf->{'iface'}{$port} //= {};
+		# make config stub
+		if ($type =~ /^(bond|vrf)$/) {
+			$conf->{$type}{$port} //= {};
+		}
+		return ($type, $port);
+	}
+}
+
+sub find_ip_net4 {
+	my ($ip, @nets) = @_;
+	my $b = ipbit4($ip);
+	foreach my $n (@nets) {
+		my $m = 32;
+		$n =~ s!/(?<mask>\d+)$!! and $m = $+{'mask'};
+		my $c = ipbit4($n);
+		substr($b, 0, $m) eq substr($c, 0, $m) and return 1;
+	}
+	return 0;
+}
+
+sub find_ip_net6 {
+	my ($ip, @nets) = @_;
+	my $b = ipbit6($ip);
+	foreach my $n (@nets) {
+		my $m = 128;
+		$n =~ s!/(?<mask>\d+)$!! and $m = $+{'mask'};
+		my $c = ipbit6($n);
+		substr($b, 0, $m) eq substr($c, 0, $m) and return 1;
+	}
+	return 0;
+}
+
+sub find_ip_net {
+	my ($ip, @nets) = @_;
+	my $ver = ip_ver($ip);
+	$ver eq 'ipv4' and return find_ip_net4($ip, @nets);
+	$ver eq 'ipv6' and return find_ip_net6($ip, @nets);
+	return 0;
+}
+
+sub check_route_dest {
+	my ($conf, $via, $vrf) = @_;
+	if (defined $via->{'dev'}) {
+		my $d = $via->{'dev'};
+		($conf->{'iface'}{$d}{'master'} // '') =~ /^vrf / or die("device $d in route is not in vrf");
+		if (defined $via->{'via'}) {
+			my $ver = ip_ver($via->{'via'});
+			find_ip_net($via->{'via'}, keys %{$conf->{'addr'}{$d}{$ver}}) or die("via address ".$via->{'via'}." is not connected on the device $d");
+		}
+	} elsif (defined $via->{'via'}) {
+		# find dev in vrf
+		my $ip = $via->{'via'};
+		my $viadev = {};
+		my $ver = ip_ver($ip);
+		foreach my $d (keys %{$conf->{'iface'}}) {
+			($conf->{'iface'}{$d}{'master'} // '') eq $vrf or next;
+			if (find_ip_net($ip, keys %{$conf->{'addr'}{$d}{$ver} // {}})) {
+				$viadev->{$d} = 1;
+			}
+		}
+		keys %$viadev == 0 and die("can not find device for $ip in $vrf");
+		keys %$viadev > 1 and die("multiple devices for $ip in $vrf");
+		$via->{'dev'} = (keys %$viadev)[0];
+	}
+	return 1;
+}
+
+sub check_route_mix {
+	my @r = @_;
+	my $nh = {};
+	my $to;
+	foreach my $via (@r) {
+		if (defined $via->{'via'}) {
+			my $k = 'via '.$via->{'via'}.' dev '.$via->{'dev'};
+			($to // 'via') eq 'via' or die("mix of route types: $k vs $to");
+			$to = 'via';
+			defined $nh->{$k} and die("route is redefined: $k");
+			$nh->{$k} = 1;
+		} elsif (defined $via->{'dev'}) {
+			defined $to and die("mix of route types: dev vs $to");
+			$to = 'dev';
+		} elsif (defined $via->{'blackhole'}) {
+			defined $to and die("mix of route types: blackhole vs $to");
+			$to = 'blackhole';
+		} else {
+			die("oops: route with no destination");
+		}
+	}
+	return 0;
+}
+
+sub parse_next_file {
+	my ($conf, $fh) = @_;
+
+	my $section = 'global';
+	my $section_type = 'global';
+
+	my $l;
+	while ($l = <$fh>) {
+		# remove comments and trailing spaces
+		$l =~ s/\s*(#.*)?$//;
+		# remove beginning spaces
+		$l =~ s/^\s+//;
+		# skip empty line
+		$l eq '' and next;
+
+		# check if new section
+		if ($l =~ /^\[\s*(?<name>\S|\S.*\S)\s*\]$/) {
+			my ($ntype, $nsec) = parse_section($conf, $+{'name'});
+			defined $nsec and defined $ntype or die("bad section: $l");
+			$section = $nsec;
+			$section_type = $ntype;
+			next;
+		}
+
+		my $parser = $section_parser->{$section_type};
+		defined $parser or die("parser for section type $section_type is not defined");
+
+		&$parser($conf, $section, $l) or die("Bad directive: $l");
+	}
+}
+
+sub read_config {
+	my $conf = {
+		'addr' => {},
+		'bond' => {},
+		'iface' => {},
+		'split' => {},
+		'switch' => {},
+		'vrf' => {},
+	};
+
+	# read and parse text
+	my $l;
+	my $incloop = {};
+	@ARGV or push(@ARGV, '-');
+	while ($_curfilename = shift(@ARGV)) {
+		open($_curfilehandle, $_curfilename) or die("failed to open file: $_curfilename");
+
+		# check for duplicate
+		my $stat = [stat $_curfilehandle];
+		my $key = ($stat->[0] // '').'!'.($stat->[1] // '');
+		if (defined $incloop->{$key}) {
+			print STDERR "## ignoring duplicate file: $_curfilename\n";
+			next;
+		}
+		$incloop->{$key} = 1;
+
+		parse_next_file($conf, $_curfilehandle);
+		$! and die("failed to read config from: $_curfilename");
+		close($_curfilehandle);
+	}
+
+	# check consistency, add default values
+	my $tmp;
+	# split ports have no other config
+	# split number
+	foreach my $p (keys %{$conf->{'split'}}) {
+		$p =~ /^port / or die("split for non-port $p");
+		hash_empty($conf->{'iface'}{$p}) or die("splitted port ($p) can not be configured with anything else");
+		delete $conf->{'iface'}{$p};
+		defined $conf->{'addr'}{$p} and die("splitted port ($p) can not be configured with anything else");
+		my $n = $conf->{'split'}{$p};
+		$n > 1 and $n <= 10 or die("bad split number for $p: $n");
+	}
+	# subports have corresponding split
+	foreach my $p (keys %{$conf->{'iface'}}) {
+		$p =~ m!^port (?<num>\d+)/(?<sub>\d+)$! or next;
+		my $base = "port ".$+{'num'};
+		my $min = $+{'sub'} + 1;
+		defined $conf->{'split'}{$base} or die("use of subport, when port is not splitted: $p");
+		$conf->{'split'}{$base} >= $min or die("subport number is greater than split number: $p");
+	}
+	# every dev mentioned in switch has it as master
+	# vlan consistency (port has no same tag and native vlan)
+	foreach my $p (keys %{$conf->{'switch'}}) {
+		($conf->{'iface'}{$p}{'master'} // '') eq 'switch' or die("port $p does not have switch as its master");
+		if (defined $conf->{'switch'}{$p}{'native'}) {
+			if ((keys %{$conf->{'switch'}{$p}{'native'}}) == 0) {
+				delete $conf->{'switch'}{$p}{'native'};
+			} else {
+				(keys %{$conf->{'switch'}{$p}{'native'}}) > 1 and die("multiple native vlans at $p");
+				my $n = (keys %{$conf->{'switch'}{$p}{'native'}})[0];
+				$n > 0 and $n < 4096 or die("bad native vlan at $p: $n");
+				defined $conf->{'switch'}{$p}{'tag'}{$n} and die("port $p has vlan $n both native and tagged");
+			}
+		}
+		foreach my $v (keys %{$conf->{'switch'}{$p}{'tag'} // {}}) {
+			$v > 0 and $v < 4096 or die("bad tag vlan at $p: $v");
+		}
+	}
+	# set native vlan 1 on switch as default
+	keys %{$conf->{'switch'} // {}} > 0
+	and not defined $conf->{'switch'}{'switch'}{'native'}
+	and not defined $conf->{'switch'}{'switch'}{'tag'}{1}
+	and $conf->{'switch'}{'switch'}{'native'} = { 1 => 1 };
+	# port master only bond/switch/vrf
+	# bond master only switch/vrf
+	# vlan master only vrf
+	# loopback master only vrf
+	# vrf has no master
+	foreach my $p (keys %{$conf->{'iface'}}) {
+		defined $conf->{'iface'}{$p}{'master'} or next;
+		my $m = $conf->{'iface'}{$p}{'master'};
+		$p =~ /^port / and $m =~ /^(bond|vrf) |^switch$/
+		or $p =~ /^bond / and $m =~ /^vrf |^switch$/
+		or $p =~ /^(vlan|loopback) / and $m =~ /^vrf /
+		or die("unsupported master $m for device $p");
+	}
+	# each interface with address has master vrf
+	# interfaces in the same vrf have different addresses
+	# (excluding ipv6 link-local)
+	# add vlan on switch for l3 vlan ports, and base for vlan iface
+	my $vrfver = {};
+	$tmp = {};
+	foreach my $p (keys %{$conf->{'addr'}}) {
+		($conf->{'iface'}{$p}{'master'} // '') =~ /^vrf / or die("device $p is l3 and should be in vrf");
+		if ($p =~ /^vlan (?<vid>\d+)$/) {
+			$conf->{'switch'}{'switch'}{'tag'}{$+{'vid'}} = 1;
+			$conf->{'iface'}{$p}{'base'} = 'switch';
+		}
+		my $a = $conf->{'addr'}{$p};
+		my $m = $conf->{'iface'}{$p}{'master'};
+		foreach my $ver (keys %$a) {
+			foreach my $ip (keys %{$a->{$ver}}) {
+				$ip =~ s!/.*$!!;
+				# skip check for ipv6 link-locak
+				$ver eq 'ipv6' and find_ip_net6($ip, @ipv6_linklocal) and next;
+				defined $tmp->{$m}{$ver}{$ip} and die("address $ip on $p in $m is already defined on some other device");
+				$tmp->{$m}{$ver}{$ip} = 1;
+			}
+			$vrfver->{$m}{$ver} = 1;
+		}
+	}
+	# vrf tables defined and have different numbers
+	# move routes from vrf to its place
+	foreach my $vrf (keys %{$conf->{'vrf'}}) {
+		defined $conf->{'vrf'}{$vrf}{'table'} or die("table is not defined for $vrf");
+		my $t = $conf->{'vrf'}{$vrf}{'table'};
+		$t > 0 and $t < 253 or die("bad table number $t for $vrf");
+		defined $conf->{'route'}{$t} and die("table $t for $vrf is alredy defined");
+		$conf->{'route'}{$t} = $conf->{'vrf'}{$vrf}{'route_tmp'} // {};
+		delete $conf->{'vrf'}{$vrf}{'route_tmp'};
+	}
+	# vrf routes does not have blackhole/dev only/via mixed up
+	# vrf routes dev have master vrf and corresponding address for via
+	# find interface for via routes with no dev
+	# vrf routes do not have duplicate gateway on the same iface
+	foreach my $vrf (keys %{$conf->{'vrf'}}) {
+		my $t = $conf->{'vrf'}{$vrf}{'table'};
+		# add default fallback routes
+		foreach my $ver (keys %{$vrfver->{$vrf} // {}}) {
+			my $def;
+			if ($ver eq 'ipv4') { $def = '0.0.0.0/0'; }
+			elsif ($ver eq 'ipv6') { $def = '::/0'; }
+			else { die("bad version $ver for $vrf"); }
+			my $key = "$def 4278198272 0";
+			defined $conf->{'route'}{$t}{$ver}{$key} and die("fallback default route metric is taken in $vrf family $ver");
+			$conf->{'route'}{$t}{$ver}{$key} = [{
+				'weight' => 1,
+				'blackhole' => 1,
+			}];
+		}
+		my $vrfroutes = $conf->{'route'}{$t};
+		defined $vrfroutes or next;
+		foreach my $ver (keys %{$vrfroutes}) {
+			foreach my $pfx (keys %{$vrfroutes->{$ver}}) {
+				my $r = $vrfroutes->{$ver}{$pfx};
+				# add missing devs and check devs are in vrf
+				foreach my $via (@$r) {
+					check_route_dest($conf, $via, $vrf);
+				}
+				# check mix of route type and duplicate via
+				check_route_mix(@$r);
+			}
+		}
+	}
+
+	# set missing subports down by default
+	foreach my $p (keys %{$conf->{'split'}}) {
+		my $n = $conf->{'split'}{$p};
+		foreach my $k (0..($n-1)) {
+			my $sub = "$p/$k";
+			$conf->{'iface'}{$sub} //= { 'down' => 1 };
+		}
+	}
+	
+	# set bond default configuration
+	foreach my $p (keys %{$conf->{'bond'}}) {
+		my $b = $conf->{'bond'}{$p};
+		$b->{'min_links'} //= 1;
+		$b->{'lacp_rate'} //= 'fast';
+		$b->{'mode'} //= '802.3ad';
+		$b->{'xmit_hash_policy'} //= 'layer3+4';
+	}
+
+	return $conf;
+}
+
+sub run_port_names {
+	my ($conf) = @_;
+
+	my %maxsplit = ();
+
+	# find interface names and split
+	foreach my $l (devlink('port show')) {
+		$l =~ m!^(?<handle>pci[0-9:/\.]+): type (?<type>.*)$! or die("bad devlink line: $l");
+		my ($devlink, $lt) = ($+{'handle'}, $+{'type'});
+		($lt =~ /^eth netdev (?<name>enp\d+s\d+np(?<num>\d+)(s(?<sub>\d+))?)( |$)/) or next;
+		my ($name, $num, $sub) = ($+{'name'}, $+{'num'}, $+{'sub'} // '');
+		my $p = "port $num";
+		my $base = $p;
+		if ($sub eq '') {
+			delete $conf->{'split'}{$p};
+		} else {
+			$p .= "/$sub";
+			$maxsplit{$base} = max($sub + 1, $maxsplit{$base} // 0);
+		}
+ 		$conf->{'iface'}{$p}{'devlink'} = $devlink;
+		$conf->{'iface'}{$p}{'name'} = $name;
+	}
+
+	foreach my $p (keys %maxsplit) {
+		$conf->{'split'}{$p} = $maxsplit{$p};
+	}
+}
+
+sub parse_route_line {
+	my ($ver, $l) = @_;
+
+	my $ipfun;
+	if ($ver eq 'ipv4') { $ipfun = \&parse_prefix4; }
+	elsif ($ver eq 'ipv6') { $ipfun = \&parse_prefix6; }
+	else { die("bad ip version: $ver"); }
+
+	my $r = {};
+	my $t;
+	my $s = $l;
+	$s =~ s/\\/ /g;
+	($t, $s) = next_word($s);
+
+	defined $t or die("bad route line: $l");
+	if ($t ne 'default' and ip_ver($t) eq '') {
+		$r->{'type'} = $t;
+		($t, $s) = next_word($s);
+	}
+	defined $t or die("bad route line: $l");
+	$t = &$ipfun($t);
+	defined $t or die("bad prefix in route: $l");
+	$r->{'prefix'} = $t;
+
+	my $nh = {};
+	my $wasnh = 0;
+
+	while ($s !~ /^\s*$/) {
+		($t, $s) = next_word($s);
+
+		if ($t eq 'via') {
+			($t, $s) = next_word($s);
+			my $via = &$ipfun($t // '', 0);
+			defined $via or die("bad via address in route line: $l");
+			$nh->{'via'} = $via;
+			$wasnh = 1;
+			next;
+		} elsif ($t eq 'dev') {
+			($t, $s) = next_word($s);
+			defined $t or die("no device name in route line: $l");
+			$nh->{'dev'} = $t;
+			$wasnh = 1;
+			next;
+		} elsif ($t eq 'weight') {
+			($t, $s) = next_word($s);
+			($t // '') =~ /^\d+$/ or die("bad weight in route line: $l");
+			$nh->{'weight'} = int($t);
+			$wasnh = 1;
+			next;
+		} elsif ($t =~ /^(dead|linkdown|offload)$/) {
+			# do not set $wasnh
+			# some attrs can be shown for the whole route
+			#$wasnh = 1;
+			next;
+		}
+
+		if ($wasnh) {
+			push @{$r->{'nexthop'}}, $nh;
+			$nh = {};
+			$wasnh = 0;
+		}
+
+		if ($t eq 'nexthop') {
+			# do nothing
+		} elsif ($t eq 'tos') {
+			($t, $s) = next_word($s);
+			($t // '') =~ /^0x[0-9a-fA-F]+$/ or die("bad tos value in route line: $l");
+			$r->{'tos'} = hex($t);
+		} elsif ($t eq 'metric') {
+			($t, $s) = next_word($s);
+			($t // '') =~ /^\d+$/ or die("bad metric value in route line: $l");
+			$r->{'metric'} = int($t);
+		} elsif ($t =~ /^(pref|scope)$/) {
+			# ignore this option
+			my $tmp;
+			($tmp, $s) = next_word($s);
+			defined $tmp or die("no value for option $t in route line: $l");
+		} else {
+			die("unsupported token '$t' in route line: $l");
+		}
+	}
+
+	$wasnh and push @{$r->{'nexthop'}}, $nh;
+
+	$r->{'type'} //= 'unicast';
+	$r->{'tos'} //= 0;
+	if ($ver eq 'ipv4') {
+		$r->{'metric'} //= 0;
+	} elsif ($ver eq 'ipv6') {
+		$r->{'metric'} //= 1024;
+	}
+
+	my $res = {};
+	$res->{'key'} = $r->{'prefix'}.' '.$r->{'metric'}.' '.$r->{'tos'};
+	if ($r->{'type'} eq 'blackhole') {
+		$res->{'route'} = [{ 'blackhole' => 1, 'weight' => 1 }];
+	} elsif ($r->{'type'} eq 'unicast') {
+		@{$r->{'nexthop'}} > 0 or die("unicast route without nexthops: $l");
+		foreach my $nh (@{$r->{'nexthop'}}) {
+			$nh->{'weight'} //= 1;
+			my $a = {};
+			$a->{'weight'} = $nh->{'weight'};
+			defined $nh->{'via'} and $a->{'via'} = $nh->{'via'};
+			defined $nh->{'dev'} and $a->{'devraw'} = $nh->{'dev'};
+			push @{$res->{'route'}}, $a;
+		}
+	}
+
+	return $res;
+}
+
+sub route_match_dev {
+	my ($ifdev, @routes) = @_;
+
+	foreach my $r (@routes) {
+		defined $r->{'devraw'} or next;
+		my $d = $r->{'devraw'};
+		delete $r->{'devraw'};
+		$r->{'dev'} = $ifdev->{$d} // "raw $d";
+	}
+}
+
+sub run_get_routes {
+	my ($conf) = @_;
+
+	my $ifdev = {};
+
+	# make interface name map
+	foreach my $iface (keys %{$conf->{'iface'}}) {
+		my $name = $conf->{'iface'}{$iface}{'name'};
+		$name //= iface2dev($iface);
+		$ifdev->{$name} = $iface;
+	}
+
+	# get all tables
+	my %tables = ();
+	foreach my $vrf (keys %{$conf->{'vrf'}}) {
+		$tables{$conf->{'vrf'}{$vrf}{'table'}} = 1;
+	}
+	foreach my $r (keys %{$conf->{'route'}}) {
+		$tables{$r} = 1;
+	}
+
+	# find routes in tables
+	foreach my $t (keys %tables) {
+		foreach my $l (ip("-o -4 route show proto $route_proto table $t")) {
+			my $r = parse_route_line('ipv4', $l);
+			route_match_dev($ifdev, @{$r->{'route'}});
+			defined $r and push @{$conf->{'route'}{$t}{'ipv4'}{$r->{'key'}}}, @{$r->{'route'}};
+		}
+		foreach my $l (ip("-o -6 route show proto $route_proto table $t")) {
+			my $r = parse_route_line('ipv6', $l);
+			route_match_dev($ifdev, @{$r->{'route'}});
+			defined $r and push @{$conf->{'route'}{$t}{'ipv6'}{$r->{'key'}}}, @{$r->{'route'}};
+		}
+	}
+}
+
+my @_sysctl_values = (
+	['net.ipv4.ip_forward' => '1'],
+	['net.ipv4.fib_multipath_hash_policy' => '0'],
+	[qr/^net\.ipv4\.conf\.[^\.]+\.(accept|secure|send)_redirects$/ => '0'],
+	[qr/^net\.ipv4\.conf\.[^\.]+\.(rp_filter|shared_media|mc_forwarding)$/ => '0'],
+	[qr/^net\.ipv4\.conf\.[^\.]+\.ignore_routes_with_linkdown$/ => '1'],
+	[qr/^net\.ipv6\.conf\.[^\.]+\.accept_(ra|redirects|source_route)$/ => '0'],
+	[qr/^net\.ipv6\.conf\.[^\.]+\.(autoconf|mc_forwarding|disable_ipv6)$/ => '0'],
+	[qr/^net\.ipv6\.conf\.[^\.]+\.(forwarding|ignore_routes_with_linkdown|keep_addr_on_down)$/ => '1'],
+	[qr/^net\.ipv6\.conf\.[^\.]+\.addr_gen_mode$/ => '3'],
+);
+
+sub sysctl_default {
+	my ($key) = @_;
+	foreach my $l (@_sysctl_values) {
+		my ($e, $v) = @$l;
+		if (ref($e) eq '') {
+			$key eq $e and return $v;
+		} elsif (ref($e) eq 'Regexp') {
+			$key =~ /$e/ and return $v;
+		} else {
+			die("oops sysctl_default");
+		}
+	}
+	return undef;
+}
+
+sub run_get_sysctl {
+	my ($conf) = @_;
+	foreach my $l (sysctl('-a')) {
+		$l =~ /^(?<key>\S+) = (?<val>.*)$/ or next;
+		my ($key, $val) = ($+{'key'}, $+{'val'});
+		my $def = sysctl_default($key);
+		defined $def or next;
+		$def eq $val and next;
+		$conf->{'global'}{'sysctl'}{$key} = $val;
+	}
+}
+
+sub run_get_qdisc {
+	my ($conf) = @_;
+	foreach my $p (keys %{$conf->{'iface'}}) {
+		$p =~ /^port / or next;
+		defined $conf->{'iface'}{$p}{'name'} or die("no name for $p");
+		my $dev = $conf->{'iface'}{$p}{'name'};
+		my $isingress = 0;
+		foreach my $l (tc("qdisc show dev $dev")) {
+			if ($l =~ /^qdisc ingress .* ingress_block 100( |$)/) {
+				$isingress = 1;
+				last;
+			}
+		}
+		$isingress or $conf->{'iface'}{$p}{'qdisc'}{'ingress'} = 0;
+	}
+}
+
+sub run_check_iprule {
+	my ($conf) = @_;
+
+	# ipv4
+	my $no0 = 1;
+	my $is30k = 0;
+	foreach my $l (ip("rule show")) {
+		if ($l =~ /^0:\s+from\s+all\s+lookup\s+local\s*$/) {
+			$no0 = 0;
+		} elsif ($l =~ /^30000:\s+from\s+all\s+lookup\s+local\s*$/) {
+			$is30k = 1;
+		}
+	}
+	$no0 and $is30k or $conf->{'global'}{'ip_rule_move_local'} = 0;
+
+	# ipv6
+	$no0 = 1;
+	$is30k = 0;
+	foreach my $l (ip("-6 rule show")) {
+		if ($l =~ /^0:\s+from\s+all\s+lookup\s+local\s*$/) {
+			$no0 = 0;
+		} elsif ($l =~ /^30000:\s+from\s+all\s+lookup\s+local\s*$/) {
+			$is30k = 1;
+		}
+	}
+	$no0 and $is30k or $conf->{'global'}{'ip6_rule_move_local'} = 0;
+}
+
+sub run_get_vlan {
+	my ($conf, $iplink) = @_;
+
+	my $dev;
+	my $port;
+
+	foreach my $l (bridge('vlan show')) {
+		$l =~ /^\s*port\s+vlan\s+ids\s*$/ and next;
+		if ($l eq '') {
+			$dev = undef;
+			$port = undef;
+			next;
+		}
+		if ($l =~ s/^(?<dev>\S+)\s/ /) {
+			$dev = $+{'dev'};
+			if ($dev eq $conf->{'iface'}{'switch'}{'name'}) {
+				$port = 'switch';
+			} else {
+				$port = $iplink->{$dev}{'name'};
+			}
+		}
+		defined $port or next;
+
+		my $s = $l;
+		while ($s !~ /^\s*$/) {
+			my $vid;
+			($vid, $s) = next_vlan($s);
+			defined $vid or die("bad vlan line for $dev: $l");
+			my $s1 = $s;
+			my $untag = 0;
+			my $is_pvid = 0;
+			my $is_untag = 0;
+			while (1) {
+				my $t;
+				($t, $s1) = next_word($s);
+				$t //= '';
+				if ($t =~ /^(Egress|Untagged|untagged)$/) {
+					$is_untag = 1;
+					$s = $s1;
+				} elsif ($t eq 'PVID') {
+					$is_pvid = 1;
+					$s = $s1;
+				} else {
+					last;
+				}
+			}
+			if ($is_pvid and $is_untag) {
+				$untag = 1;
+			} elsif ($is_pvid or $is_untag) {
+				$untag = 1;
+				$conf->{'switch'}{$port}{'native'}{'broken'} = 1;
+			}
+
+			$conf->{'switch'}{$port} //= {};
+			my $t = $untag ? 'native' : 'tag';
+
+			$conf->{'switch'}{$port}{$t}{$vid} = 1;
+		}
+	}
+}
+
+
+sub run_get_config {
+	my ($newtables) = @_;
+
+	my $conf = {
+		'addr' => {},
+		'bond' => {},
+		'iface' => {},
+		'route' => { map { $_ => {} } @$newtables },
+		'split' => {},
+		'switch' => {},
+		'vrf' => {},
+	};
+	defined $port_prefix or find_port_prefix();
+
+	my $iplink = {};
+
+	foreach my $l (ip("-d -o link show")) {
+		my $c = {};
+		$l =~ /^\d+: (?<name>[^\s\@:]+)(@(?<base>[^\s:]+))?: <(?<flags>[^>]+)> (?<keys>.*)$/ or die("bad interface line: $l");
+		my $iface = $+{'name'};
+		defined $+{'base'} and $+{'base'} ne 'NONE' and $c->{'base'} = $+{'base'};
+		$c->{'flags'} = ','.$+{'flags'}.',';
+
+		$l = ' '.$+{'keys'}.' ';
+		$l =~ s/\\/ \\ /g;
+
+		$c->{'down'} = $c->{'flags'} =~ /,UP,/ ? 0 : 1;
+		$l =~ /\sportname\s+(?<val>\S+)\s/ and $c->{'portname'} = $+{'val'};
+		my @a = split(/\\/, $l);
+		$l = shift @a;
+		shift @a; # link/ether addr
+		$l =~ /\smaster\s+(?<val>\S+)\s/ and $c->{'master'} = $+{'val'};
+		$l =~ /\sqdisc\s+(?<val>\S+)\s/ and $c->{'qdisc'} = $+{'val'};
+		$l =~ /\smtu\s+(?<val>\S+)\s/ and $c->{'mtu'} = $+{'val'};
+		foreach my $l (@a) {
+			my $t = '';
+			$l =~ /^\s*(?<val>\S+)\s/ and $t = $+{'val'};
+			if ($t =~ /_slave$/) {
+				defined $c->{'slavetype'} and die("double slave type for $iface: $t, ".$c->{'slavetype'});
+				$c->{'slavetype'} = $t;
+			} else {
+				defined $c->{'type'} and die("double type for $iface: $t, ".$c->{'type'});
+				$c->{'type'} = $t;
+			}
+			if ($t eq 'bond') {
+				$l =~ /\smode\s+(?<val>\S+)\s/ and $c->{'bond_mode'} = $+{'val'};
+				$l =~ /\sxmit_hash_policy\s+(?<val>\S+)\s/ and $c->{'bond_xmit_hash_policy'} = $+{'val'};
+				$l =~ /\smin_links\s+(?<val>\S+)\s/ and $c->{'bond_min_links'} = $+{'val'};
+				$l =~ /\slacp_rate\s+(?<val>\S+)\s/ and $c->{'bond_lacp_rate'} = $+{'val'};
+			} elsif ($t eq 'bridge') {
+				$l =~ /\svlan_filtering\s+(?<val>\S+)\s/ and $c->{'bridge_vlan_filtering'} = $+{'val'};
+			} elsif ($t eq 'vrf') {
+				$l =~ /\stable\s+(?<val>\S+)\s/ and $c->{'vrf_table'} = $+{'val'};
+			} elsif ($t eq 'vlan') {
+				$l =~ /\sid\s+(?<val>\S+)\s/ and $c->{'vlan_id'} = $+{'val'};
+			}
+		}
+		
+		$iplink->{$iface} = $c;
+	}
+
+	foreach my $l (ip("-o addr show")) {
+		my $c = {};
+		$l =~ /^\d+: (?<name>[^\s\@:]+)\s+(?<family>\S+)\s+(?<ip>\S+)\s/ or die("bad address line: $l");
+		my ($iface, $ip, $f) = ($+{'name'}, $+{'ip'}, $+{'family'});
+		if ($f eq 'inet') {
+			$f = 'ipv4';
+			$ip = parse_prefix4($ip);
+		} elsif ($f eq 'inet6') {
+			$f = 'ipv6';
+			$ip = parse_prefix6($ip);
+			my $addr = $ip;
+			$addr =~ s!/\d+$!!;
+			# skip link-local address if nodad is not set
+			# nodad flag is set on managed link-local addresses
+			if (find_ip_net6($addr, @ipv6_linklocal)) {
+				$l =~ / nodad / or next;
+			}
+		} else {
+			next;
+		}
+		$iplink->{$iface}{'addr'}{$f}{$ip} = 1;
+	}
+
+	# get port names, devlink handle and split number
+	run_port_names($conf);
+
+	# fill list with interfaces falling under our pattern
+	my @iflist = grep(/^$our_iface$/, keys %$iplink);
+	my $ifconf = { map { $_ => 1; } @iflist };
+	my $ifsw;
+
+	while (@iflist) {
+		my $name = shift @iflist;
+		my $port;
+		my $iface = $iplink->{$name};
+		# add related interfaces to list
+		for my $p ($iface->{'base'}, $iface->{'master'}) {
+			defined $p or next;
+			defined $ifconf->{$p} and next;
+			$ifconf->{$p} = 1;
+			push @iflist, $p;
+		}
+
+		if ($name =~ /^(?<type>bond|loop|vlan|vrf)([-_](?<name>[-_a-zA-Z0-9]+)|(?<name>\d[-_a-zA-Z0-9]*))$/) {
+			$port = ($+{'type'} eq 'loop' ? 'loopback' : $+{'type'}).' '.$+{'name'};
+		} else {
+			$port = "raw $name";
+		}
+
+		# check if port
+		if (defined $iface->{'portname'}) {
+			$iface->{'portname'} =~ /^p(?<num>\d+)(s(?<sub>\d+))?$/ or die("bad port name for $name: ".$iface->{'portname'});
+			$port = 'port '.int($+{'num'}).(defined $+{'sub'} ? '/'.$+{'sub'} : '');
+			$conf->{'iface'}{$port}{'name'} eq $name or die("oops port name mistmatch ip link ($name) vs devlink (".$conf->{'iface'}{$port}{'name'}.")");
+		} elsif (($iface->{'type'} // '') eq 'dummy') {
+			$port =~ /^loopback / or $port = "raw $name";
+		} elsif (($iface->{'type'} // '') eq 'bond') {
+			$port =~ /^bond / or $port = "raw $name";
+			$conf->{'bond'}{$port} = {
+				'min_links' => $iface->{'bond_min_links'},
+				'lacp_rate' => $iface->{'bond_lacp_rate'},
+				'mode' => $iface->{'bond_mode'},
+				'xmit_hash_policy' => $iface->{'bond_xmit_hash_policy'},
+			};
+		} elsif (($iface->{'type'} // '') eq 'vlan') {
+			$port =~ /^vlan \d+$/ or $port = "raw $name";
+			# check switch name for vlan base
+			$ifsw //= $iface->{'base'};
+			$ifsw ne $iface->{'base'} and $ifsw = '';
+		} elsif (($iface->{'type'} // '') eq 'vrf') {
+			$port =~ /^vrf / or $port = "raw $name";
+			$conf->{'vrf'}{$port}{'table'} = $iface->{'vrf_table'};
+			$conf->{'route'}{$iface->{'vrf_table'}} //= {};
+		}
+
+		# check switch name for master bridges
+		if (($iface->{'slavetype'} //= '') eq 'bridge_slave') {
+			$ifsw //= $iface->{'master'};
+			# if multiple bridge interfaces
+			$ifsw ne $iface->{'master'} and $ifsw = '';
+		}
+
+		$conf->{'iface'}{$port}{'name'} = $name;
+		($iface->{'down'} // 0) and $conf->{'iface'}{$port}{'down'} = 1;
+		$iface->{'name'} = $port;
+		defined $iface->{'addr'} and $conf->{'addr'}{$port} = $iface->{'addr'};
+	}
+
+	# check for switch interface
+	$ifsw //= '';
+	if ($ifsw ne '') {
+		my $iface = $iplink->{$ifsw};
+		# check if switch iface is ok
+		if ($iface->{'type'} eq 'bridge'
+		    and $iface->{'bridge_vlan_filtering'} == 1
+		    and ($iface->{'down'} // 0) == 0
+		    and not defined $iface->{'master'}
+		    and not defined $conf->{'addr'}{$ifsw}) {
+			my $n = $iplink->{$ifsw}{'name'};
+			$conf->{'iface'}{'switch'} = $conf->{'iface'}{$n};
+			delete $conf->{'iface'}{$n};
+			delete $ifconf->{$ifsw};
+			$conf->{'iface'}{'switch'}{'name'} = $ifsw;
+		} else {
+			$ifsw = '';
+		}
+	}
+	# setting default name is not required
+	# but causes interface to seem present
+	#$conf->{'iface'}{'switch'}{'name'} //= 'switch';
+
+	# fill interface masters
+	foreach my $dev (keys %$ifconf) {
+		my $iface = $iplink->{$dev};
+		my $port = $iface->{'name'};
+		if (defined $iface->{'master'}) {
+			$conf->{'iface'}{$port}{'master'} = $iface->{'master'} eq $ifsw ? 'switch' : $iplink->{$iface->{'master'}}{'name'};
+		}
+		if (defined $iface->{'base'}) {
+			$conf->{'iface'}{$port}{'base'} = $iface->{'base'} eq $ifsw ? 'switch' : $iplink->{$iface->{'base'}}{'name'};
+		}
+	}
+
+	# collect vlan config if we have uniq switch interface now
+	defined $conf->{'iface'}{'switch'} and run_get_vlan($conf, $iplink);
+
+	# read routes from vrfs
+	run_get_routes($conf);
+
+	# check for bad sysctl values
+	run_get_sysctl($conf);
+
+	# check ingress qdisc
+	run_get_qdisc($conf);
+
+	# check ip rule lookup local is moved
+	run_check_iprule($conf);
+
+	return $conf;
+}
+
+sub set_rename_elem {
+	my ($set, $from, $to) = @_;
+	if (defined $set->{$from}) {
+		delete $set->{$from};
+		$set->{$to} = 1;
+	}
+}
+
+sub conf_iface_map {
+	my ($conf, $key) = @_;
+
+	my $map = {};
+
+	foreach my $iface (keys %{$conf->{'iface'}}) {
+		defined $conf->{'iface'}{$iface}{$key} or next;
+		$map->{$iface.'!'.$conf->{'iface'}{$iface}{$key}} = 1;
+	}
+
+	return $map;
+}
+
+sub conf_ifdev {
+	my ($conf, $iface) = @_;
+	return ($conf->{'iface'}{$iface}{'name'} // iface2dev($iface));
+}
+
+sub iface_clear {
+	my ($conf, $iface) = @_;
+	delete $conf->{'iface'}{$iface};
+	delete $conf->{'addr'}{$iface};
+	delete $conf->{'bond'}{$iface};
+	delete $conf->{'switch'}{$iface};
+	delete $conf->{'vrf'}{$iface};
+	if ($iface eq 'switch') {
+		$conf->{'switch'} = {};
+	}
+}
+
+sub iface_set_master {
+	my ($conf, $iface, $master) = @_;
+	my $dev = conf_ifdev($conf, $iface);
+
+	# down is required for adding master
+	if (($conf->{'iface'}{$iface}{'down'} // 0) == 0) {
+		ip("link set dev $dev down");
+		$conf->{'iface'}{$iface}{'down'} = 1;
+	}
+
+	if ($master eq '') {
+		ip("link set dev $dev nomaster");
+		if (($conf->{'iface'}{$iface}{'master'} // '') eq 'switch') {
+			# clear switch config for iface too
+			delete $conf->{'switch'}{$iface};
+		}
+		delete $conf->{'iface'}{$iface}{'master'};
+	} else {
+		my $mdev = conf_ifdev($conf, $master);
+		ip("link set dev $dev master $mdev");
+		ip("link set dev $dev down");
+		$conf->{'iface'}{$iface}{'master'} = $master;
+		if ($master eq 'switch') {
+			# interfaces added have native vlan 1 by default
+			defined $conf->{'switch'}{$iface} and die("oops switch config for $iface");
+			$conf->{'switch'}{$iface}{'native'} = { 1 => 1 };
+		}
+	}
+}
+
+sub conf_drop_master {
+	my ($conf, $master) = @_;
+	foreach my $iface (sort keys %{$conf->{'iface'}}) {
+		defined $conf->{'iface'}{$iface}{'master'} or next;
+		$conf->{'iface'}{$iface}{'master'} eq $master
+		and iface_set_master($conf, $iface, '');
+	}
+}
+
+sub route_clear_dev {
+	my ($nh, $iface) = @_;
+	@$nh = grep { ($_->{'dev'} // '') ne $iface } @$nh;
+	return $nh;
+}
+
+sub conf_drop_routes {
+	my ($conf, $iface) = @_;
+
+	foreach my $t (keys %{$conf->{'route'}}) {
+		foreach my $f (keys %{$conf->{'route'}{$t}}) {
+			foreach my $r (keys %{$conf->{'route'}{$t}{$f}}) {
+				my $nh = $conf->{'route'}{$t}{$f}{$r};
+				route_clear_dev($nh, $iface);
+				if (@$nh == 0) {
+					delete $conf->{'route'}{$t}{$f}{$r};
+				} else {
+					$conf->{'route'}{$t}{$f}{$r} = $nh;
+				}
+			}
+			cmp_generic($conf->{'route'}{$t}{$f}, {})
+			and delete $conf->{'route'}{$t}{$f};
+		}
+		cmp_generic($conf->{'route'}{$t}, {})
+		and delete $conf->{'route'}{$t};
+	}
+}
+
+sub iface_delete {
+	my ($conf, $iface) = @_;
+	my $dev = conf_ifdev($conf, $iface);
+	conf_drop_master($conf, $iface);
+	conf_drop_routes($conf, $iface);
+	ip("link del dev $dev");
+	iface_clear($conf, $iface);
+}
+
+my %_iface_sort = (
+	'global' => 0,
+	'port' => 1,
+	'bond' => 2,
+	'loopback' => 3,
+	'switch' => 4,
+	'vlan' => 5,
+	'vrf' => 6,
+	'raw' => 7,
+);
+
+sub cmpiface {
+	my ($a, $b) = @_;
+	$a =~ /^(?<type>\S+)(\s(?<name>\S+))?(?<tail>.*)$/;
+	my ($at, $an, $ax) = ($+{'type'}, $+{'name'} // '', $+{'tail'});
+	$b =~ /^(?<type>\S+)(\s(?<name>\S+))?(?<tail>.*)$/;
+	my ($bt, $bn, $bx) = ($+{'type'}, $+{'name'} // '', $+{'tail'});
+	if ($at eq $bt) {
+		if ($an =~ m!^(?<n1>\d+)(/(?<n2>\d+))?$!) {
+			my ($an1, $an2) = ($+{'n1'}, $+{'n2'});
+			($bn =~ m!^(?<n1>\d+)(/(?<n2>\d+))?$!) or return -1;
+			my ($bn1, $bn2) = ($+{'n1'}, $+{'n2'});
+			($an1 != $bn1) and return ($an1 <=> $bn1);
+			if (defined $an2) {
+				defined $bn2 or return 1;
+				return ($an2 <=> $bn2);
+			} else {
+				defined $bn2 and return -1;
+				return ($ax cmp $bx);
+			}
+		} else {
+			($bn =~ m!^(?<n1>\d+)(/(?<n2>\d+))?$!) and return 1;
+			return (($an cmp $bn) or ($ax cmp $bx));
+		}
+	} else {
+		return ($_iface_sort{$at} <=> $_iface_sort{$bt});
+	}
+}
+
+sub cmpifacelist {
+	my ($a, $b) = @_;
+	my @aa = split(/!/, $a);
+	my @ab = split(/!/, $b);
+	while (@aa > 0 and @ab > 0) {
+		my $xa = shift @aa;
+		my $xb = shift @ab;
+		my $c = cmpiface($xa, $xb);
+		$c and return $c;
+	}
+	@aa > 0 and return 1;
+	@ab > 0 and return -1;
+	return 0;
+}
+
+sub sortiface {
+	return sort { cmpifacelist($a, $b) } @_;
+}
+
+sub dump_conf {
+	my ($conf) = (@_);
+	my $txt = {};
+	my $out = '';
+	my $bad = 0;
+	# global
+	my $n = 0;
+	foreach my $s (sort keys %{$conf->{'global'}{'sysctl'} // {}}) {
+		my $v = $conf->{'global'}{'sysctl'}{$s};
+		$bad = 1;
+		if (++$n > 10) {
+			push(@{$txt->{'global'}}, "# sysctl ...");
+			last;
+		} else {
+			push(@{$txt->{'global'}}, "# sysctl $s = $v");
+		}
+	}
+	if (($conf->{'global'}{'ip_rule_move_local'} // 1) == 0) {
+		$bad = 1;
+		push(@{$txt->{'global'}}, "# ip rules is not altered");
+	}
+	if (($conf->{'global'}{'ip6_rule_move_local'} // 1) == 0) {
+		$bad = 1;
+		push(@{$txt->{'global'}}, "# ip6 rules is not altered");
+	}
+	# iface
+	foreach my $iface (keys %{$conf->{'iface'}}) {
+		my $i = $conf->{'iface'}{$iface};
+		my $d = iface2dev($iface);
+		if ($iface eq 'switch') {
+			if (defined $i->{'name'} and $i->{'name'} ne $d) {
+				$bad = 1;
+				push(@{$txt->{'global'}}, "# switch dev: ".$i->{'name'});
+			}
+			if ($i->{'down'} // 0) {
+				$bad = 1;
+				push(@{$txt->{'global'}}, "# switch dev is down");
+			}
+			next;
+		}
+		if ($iface !~ /^port /
+		    and defined $i->{'name'} and $i->{'name'} ne $d) {
+			$bad = 1;
+			push(@{$txt->{$iface}}, '# device: '.$i->{'name'});
+		}
+		if ($iface =~ /^port /) {
+			# create empty config for every port
+			# if it is down, it will be ignored later
+			$txt->{$iface} //= [];
+		}
+		if ($i->{'down'} // 0) {
+			push(@{$txt->{$iface}}, 'down');
+		}
+		if (defined $i->{'base'}) {
+			if ($iface !~ /^vlan / or $i->{'base'} ne 'switch') {
+				$bad = 1;
+				push(@{$txt->{$iface}}, '# base iface: '.$i->{'base'});
+			}
+		}
+		defined $i->{'master'} or next;
+		if ($i->{'master'} =~ /^(bond|vrf) /) {
+			push(@{$txt->{$iface}}, $i->{'master'});
+		} elsif ($i->{'master'} eq 'switch') {
+			# do nothing
+		} else {
+			$bad = 1;
+			push(@{$txt->{$iface}}, '# master iface: '.$i->{'master'});
+		}
+	}
+	# split
+	foreach my $iface (keys %{$conf->{'split'}}) {
+		my $v = $conf->{'split'}{$iface};
+		push(@{$txt->{$iface}}, "split $v");
+	}
+	# bond
+	foreach my $iface (keys %{$conf->{'bond'}}) {
+		my $v = $conf->{'bond'}{$iface};
+		if ($v->{'lacp_rate'} ne 'fast'
+		    or $v->{'min_links'} ne '1'
+		    or $v->{'mode'} ne '802.3ad'
+		    or $v->{'xmit_hash_policy'} ne 'layer3+4') {
+			$bad = 1;
+			push(@{$txt->{$iface}},
+				'# bond: '.
+				'lacp_rate '.$v->{'lacp_rate'}.', '.
+				'min_links '.$v->{'min_links'}.', '.
+				'mode '.$v->{'mode'}.', '.
+				'xmit_hash_policy '.$v->{'xmit_hash_policy'});
+		}
+	}
+	# switch
+	my $vlan = {};
+	foreach my $iface (keys %{$conf->{'switch'}}) {
+		my $v = $conf->{'switch'}{$iface};
+		if ($iface eq 'switch') {
+			if (not defined $v->{'native'}{'1'}) {
+				$bad = 1;
+				push(@{$txt->{'global'}}, "# no native 1 on switch");
+			}
+			if ((keys %{$v->{'native'} // {}}) > 1) {
+				$bad = 1;
+				push(@{$txt->{'global'}}, "# broken native on switch");
+			}
+			next;
+		}
+		if ((keys %{$v->{'native'} // {}}) > 1) {
+			$bad = 1;
+			push(@{$txt->{$iface}}, "# broken native");
+		} else {
+			foreach my $id (keys %{$v->{'native'} // {}}) {
+				$vlan->{$id}{'native'}{$iface} = 1;
+				push(@{$txt->{$iface}}, "#vlan native $id");
+			}
+		}
+		if (keys(%{$v->{'tag'} // {}}) > 0) {
+			my $ids = join(', ', sort {$a <=> $b} keys %{$v->{'tag'}});
+			push(@{$txt->{$iface}}, "#vlan tag $ids");
+		}
+		foreach my $id (keys %{$v->{'tag'} // {}}) {
+			$vlan->{$id}{'tag'}{$iface} = 1;
+		}
+	}
+	foreach my $id (sort {$a <=> $b} keys %$vlan) {
+		my $iface = "vlan $id";
+		$txt->{$iface} //= [];
+		my $t = $txt->{$iface};
+		foreach my $i (sortiface keys %{$vlan->{$id}{'native'} // {}}) {
+			push(@$t, "native $i");
+		}
+		foreach my $i (sortiface keys %{$vlan->{$id}{'tag'} // {}}) {
+			push(@$t, "tag $i");
+		}
+	}
+	# vrf
+	my $vrf = {};
+	foreach my $iface (keys %{$conf->{'vrf'}}) {
+		my $v = $conf->{'vrf'}{$iface};
+		if (defined $v->{'table'}) {
+			my $t = $v->{'table'};
+			$vrf->{$t} = $iface;
+			push(@{$txt->{$iface}}, "table $t");
+		} else {
+			die("oops running vrf without table");
+		}
+	}
+	# addr
+	foreach my $iface (keys %{$conf->{'addr'}}) {
+		my $v = $conf->{'addr'}{$iface};
+		# check vlan presence on switch
+		if ($iface =~ /^vlan (?<vid>\d+)$/ and not defined $conf->{'switch'}{'switch'}{'tag'}{$+{'vid'}}) {
+			$bad = 1;
+			push(@{$txt->{$iface}}, "# no self vlan on switch");
+		}
+		foreach my $f (sort keys %$v) {
+			keys(%{$v->{$f}}) > 0 or next;
+			push(@{$txt->{$iface}}, 'ip '.join(', ', sort keys %{$v->{$f}}));
+		}
+	}
+	# route
+	foreach my $t (keys %{$conf->{'route'}}) {
+		my $v = $conf->{'route'}{$t};
+		my $iface = $vrf->{$t} // '';
+		$iface eq '' and next;
+		my $a = $txt->{$iface};
+		foreach my $f (sort keys %$v) {
+			keys(%{$v->{$f}}) > 0 or next;
+			my $wasdef = 0;
+			foreach my $key (sort keys %{$v->{$f}}) {
+				$key =~ /^(?<pfx>\S+) (?<metric>\S+) (?<tos>\S+)$/ or die("oops pfx key: $key");
+				my ($pfx, $metric, $tos) = ($+{'pfx'}, $+{'metric'}, $+{'tos'});
+				# handle default route
+				if ($pfx =~ m!^(0\.0\.0\.0/0|::/0)$! and $metric == 4278198272 and $tos == 0) {
+					# if route has default params, do not show it
+					if (cmp_generic($v->{$f}{$key}, [{'blackhole' => 1, 'weight' => 1}])) {
+						$wasdef = 1;
+						next;
+					}
+				}
+				# skip default metric
+				($f eq 'ipv4' and $metric == 0)
+				or ($f eq 'ipv6' and $metric == 1024)
+				or $pfx .= " metric $metric";
+				# skip zero tos
+				if ($tos ne '0') {
+					$pfx .= " tos $tos";
+				}
+				foreach my $r (@{$v->{$f}{$key}}) {
+					my $opt = '';
+					if (defined $r->{'blackhole'}) {
+						push(@$a, "route $pfx blackhole");
+						next;
+					}
+					foreach my $x (qw/via dev/) {
+						defined $r->{$x} and $opt .= " $x ".$r->{$x};
+					}
+					defined $r->{'weight'} and $r->{'weight'} != 1 and $opt .= ' weight '.$r->{'weight'};
+					push(@$a, "route $pfx$opt");
+				}
+			}
+			if (not $wasdef) {
+				$bad = 1;
+				push(@$a, "# default fallback route is missing or broken");
+			}
+		}
+	}
+	# show config
+	foreach my $s (sortiface keys(%$txt)) {
+		if ($s =~ /^port /) {
+			# skip trivial port config
+			cmp_generic($txt->{$s}, ['down']) and next;
+			# add comment to empty port section
+			@{$txt->{$s}} or $txt->{$s} = ["# port is up"];
+		}
+		unshift(@{$txt->{$s}}, "[$s]");
+		if ($s =~ /^raw /) {
+			$bad = 1;
+			$txt->{$s} = [map { "#$_" } @{$txt->{$s}}];
+		}
+		foreach my $l (@{$txt->{$s}}) {
+			$out .= "$l\n";
+		}
+		$out .= "\n";
+	}
+	if ($bad) {
+		$out = "# this config can not be used to redo the current state completely\n$out";
+	}
+	return $out;
+}
+
+sub vlan_del {
+	my ($conf, $iface, $id, $tag) = @_;
+	my $s = $tag ? 'tag' : 'native';
+	defined $conf->{'switch'}{$iface}{$s}{$id} or die("vlan to delete $s $id from $iface is not there");
+	delete $conf->{'switch'}{$iface}{$s}{$id};
+	if ((keys %{$conf->{'switch'}{$iface}{$s}}) == 0) {
+		delete $conf->{'switch'}{$iface}{$s};
+	}
+	$id eq 'broken' and return;
+	my $dev = conf_ifdev($conf, $iface);
+	my $opt = '';
+	$iface eq 'switch' and $opt .= ' self';
+	bridge("vlan del vid $id dev $dev$opt");
+}
+
+sub vlan_add {
+	my ($conf, $iface, $id, $tag) = @_;
+	my $dev = conf_ifdev($conf, $iface);
+	my $opt = '';
+	if ($tag) {
+		defined $conf->{'switch'}{$iface}{'tag'}{$id} and return;
+		$conf->{'switch'}{$iface}{'tag'}{$id} = 1;
+	} else {
+		my $n = $conf->{'switch'}{$iface}{'native'} // {};
+		if ((keys %$n) == 1 and (keys %$n)[0] == $id) {
+			# we already have same single native vlan
+			return;
+		}
+		foreach my $rid (sort keys %$n) {
+			# delete all current native vlans
+			$rid eq 'broken' and next;
+			bridge("vlan del vid $rid dev $dev");
+		}
+		$conf->{'switch'}{$iface}{'native'} = { $id => 1 };
+		$opt .= ' pvid untagged';
+	}
+	if ($iface eq 'switch') {
+		$opt .= ' self';
+	}
+	bridge("vlan add vid $id dev $dev$opt");
+}
+
+sub ip_ver_opt {
+	my ($ver) = @_;
+	$ver =~ s/^ipv(?<n>[46])$/-$+{n}/ or die("unsupported address family: $ver");
+	return $ver;
+}
+
+sub pfxkey2opt {
+	my ($key, $full) = @_;
+	$key =~ /^(?<pfx>\S+) (?<metric>\S+) (?<tos>\S+)$/ or die("oops pfx key: $key");
+	my $s = sprintf("%s metric %s", $+{'pfx'}, $+{'metric'});
+	($+{'tos'} != 0 or ($full // 0)) and $s .= sprintf(" tos 0x%x", $+{'tos'});
+	return $s;
+}
+
+sub route_add {
+	my ($conf, $t, $f, $pfx, $nh) = @_;
+	my $opt = ip_ver_opt($f);
+	$pfx = pfxkey2opt($pfx);
+	my $node_spec = "$pfx table $t proto $route_proto";
+	my $info_spec = '';
+	foreach my $h (@$nh) {
+		my $l = '';
+		$h = dclone($h);
+		if (defined $h->{'blackhole'}) {
+			# do not check for correctness here
+			ip("$opt route replace blackhole $node_spec");
+			next;
+		}
+		if (defined $h->{'via'}) {
+			$l .= ' via '.$h->{'via'};
+			delete $h->{'via'};
+		}
+		if (defined $h->{'dev'}) {
+			$l .= ' dev '.conf_ifdev($conf, $h->{'dev'});
+			delete $h->{'dev'};
+		}
+		if ($l ne '') {
+			$l .= ' weight '.($h->{'weight'} // 1);
+			delete $h->{'weight'};
+		}
+		(keys %$h) > 0 and die("route nexthop unsupported keys: ".join(',', keys %$h));
+		$l ne '' and $info_spec .= " nexthop$l";
+	}
+	$info_spec ne '' and ip("$opt route replace $node_spec$info_spec");
+	$conf->{'route'}{$t}{$f}{$pfx} = dclone($nh);
+}
+
+sub update_config {
+	my ($runc, $newc) = @_;
+
+	my ($todel, $toadd, $tochg, $a, $b, $c);
+
+	# global/sysctl
+	($todel, $toadd) = hash_diff($runc->{'global'}{'sysctl'} // {}, $newc->{'global'}{'sysctl'} // {});
+	foreach my $k (sort keys %{set_union($todel, $toadd)}) {
+		my $v = $newc->{'global'}{'sysctl'}{$k} // sysctl_default($k);
+		sysctl("-w $k=$v");
+		delete $runc->{'global'}{'sysctl'}{$k};
+	}
+
+	# global/ip_rule_move_local
+	if (($runc->{'global'}{'ip_rule_move_local'} // 1) == 0) {
+		ip('rule del pref 0');
+		ip('rule add pref 30000 table local');
+		delete $runc->{'global'}{'ip_rule_move_local'};
+	}
+
+	# global/ip6_rule_move_local
+	if (($runc->{'global'}{'ip6_rule_move_local'} // 1) == 0) {
+		ip('-6 rule del pref 0');
+		ip('-6 rule add pref 30000 table local');
+		delete $runc->{'global'}{'ip6_rule_move_local'};
+	}
+
+	# remove extra master links
+	$a = conf_iface_map($runc, 'master');
+	$b = conf_iface_map($newc, 'master');
+	($todel, $_, $toadd) = set_diff($a, $b);
+	foreach my $m (reverse sortiface keys %$todel) {
+		$m =~ /^(?<iface>.*)!(?<master>.*)$/ or die("oops map master: $m");
+		my $iface = $+{'iface'};
+		iface_set_master($runc, $iface, '');
+	}
+	# check for master links to be added
+	# that here is no holes in master chains
+	# because adding master dev, which have master itself is not supported
+	foreach my $m (reverse sortiface keys %$toadd) {
+		$m =~ /^(?<iface>.*)!(?<master>.*)$/ or die("oops map master: $m");
+		my $iface = $+{'iface'};
+		defined $runc->{'iface'}{$iface} or next;
+		my $master = $+{'master'};
+		while (defined $master) {
+			if (defined $runc->{'iface'}{$master}{'master'}) {
+				iface_set_master($runc, $master, '');
+			}
+			$master = $newc->{'iface'}{$master}{'master'};
+		}
+	}
+
+	# remove devices with incorrect base
+	$a = conf_iface_map($runc, 'base');
+	$b = conf_iface_map($newc, 'base');
+	($todel, $_, $_) = set_diff($a, $b);
+	foreach my $m (sort keys %$todel) {
+		$m =~ /^(?<iface>.*)!(?<master>.*)$/ or die("oops map base: $m");
+		my $iface = $+{'iface'};
+		iface_delete($runc, $iface);
+	}
+
+	# remove extra interfaces
+	# mark them to delete to check if there are not base links to them
+	$a = hash_keys($runc->{'iface'});
+	$b = hash_keys($newc->{'iface'});
+	($todel, $tochg, $_) = set_diff($a, $b);
+	$c = {}; # list of ifaces to delete
+	# delete missing
+	foreach my $iface (sort keys %$todel) {
+		# except ports
+		$iface =~ /^port / and next;
+		$c->{$iface} = 1;
+	}
+	# delete changed
+	foreach my $iface (reverse sortiface keys %$tochg) {
+		if (defined $newc->{'iface'}{$iface}{'name'}) {
+			# if new config has interface name defined
+			# and it differs from running
+			if ($runc->{'iface'}{$iface}{'name'}
+			    eq $newc->{'iface'}{$iface}{'name'}) {
+				$c->{$iface} = 1;
+				next;
+			}
+		}
+
+		if ($iface =~ /^vrf /) {
+			cmp_generic($runc->{'vrf'}{$iface}, $newc->{'vrf'}{$iface})
+			and next;
+		} elsif ($iface =~ /^bond /) {
+			cmp_generic($runc->{'bond'}{$iface}, $newc->{'bond'}{$iface})
+			and next;
+		} else {
+			next;
+		}
+
+		# delete master links and device
+		$c->{$iface} = 1;
+	}
+	# delete interfaces that have base link to those in delete list
+	# there should not be base chains
+	foreach my $iface (keys %{$runc->{'iface'}}) {
+		defined $runc->{'iface'}{$iface}{'base'} or next;
+		my $base = $runc->{'iface'}{$iface}{'base'};
+		defined $c->{$base} or next;
+		# interface has base to be deleted
+		# delete it first
+		iface_delete($runc, $iface);
+	}
+	# then delete interfaces from the list
+	foreach my $iface (keys %$c) {
+		defined $runc->{'iface'}{$iface} or next;
+		iface_delete($runc, $iface);
+	}
+
+	# remove extra addresses
+	$a = hash_keys($runc->{'addr'});
+	$b = hash_keys($newc->{'addr'});
+	($todel, $tochg, $_) = set_diff($a, $b);
+	# flush interfaces missing in new config
+	foreach my $iface (sort keys %$todel) {
+		my $dev = conf_ifdev($runc, $iface);
+		ip("address flush dev $dev");
+		delete $runc->{'addr'}{$iface};
+	}
+	# address is set in both running and new config
+	foreach my $iface (sort keys %$tochg) {
+		my $dev = conf_ifdev($runc, $iface);
+
+		# if interface is in different vrf, then flush it
+		if (($runc->{'iface'}{$iface}{'master'} // '')
+		    ne ($newc->{'iface'}{$iface}{'master'} // '')) {
+			ip("address flush dev $dev");
+			delete $runc->{'addr'}{$iface};
+			next;
+		}
+
+		my $r = $runc->{'addr'}{$iface};
+		my $n = $newc->{'addr'}{$iface};
+
+		# flush undefined families
+		($todel, $a, $_) = set_diff(hash_keys($r), hash_keys($n));
+		foreach my $ver (sort keys %$todel) {
+			my $opt = ip_ver_opt($ver);
+			ip("$opt address flush dev $dev");
+			delete $r->{$ver};
+		}
+
+		# remove specific addresses
+		for my $ver (sort keys %$a) {
+			my $opt = ip_ver_opt($ver);
+			my $rv = $r->{$ver} // {};
+			my $nv = $n->{$ver} // {};
+
+			# check if no changes
+			cmp_generic($rv, $nv) and next;
+
+			# delete extra addresses
+			($todel, $_, $_) = set_diff($rv, $nv);
+			foreach my $ip (sort keys %$todel) {
+				ip("$opt address del $ip dev $dev");
+				delete $rv->{$ip};
+			}
+		}
+
+		# delete iface in config if flushed
+		cmp_generic($r, {}) and delete $runc->{'addr'}{$iface};
+	}
+
+	# split/unsplit interfaces
+	($todel, $toadd) = hash_diff($runc->{'split'} // {}, $newc->{'split'} // {});
+	$a = {};
+	# unsplit first
+	my $togetport = 0;
+	foreach my $p (sort keys %$todel) {
+		# port subinterface 0 should exist
+		my $dl = $runc->{'iface'}{"$p/0"}{'devlink'};
+		my $dev = $runc->{'iface'}{"$p/0"}{'name'};
+		defined $dl and defined $dev or die("oops $p/0 does not exist to unsplit");
+
+		devlink("port unsplit $dl");
+
+		foreach my $iface (keys %{$runc->{'iface'}}) {
+			$iface =~ /^port / or next;
+			my $base = $iface;
+			$base =~ s!/\d+$!! or next;
+			$p eq $base or next;
+			iface_clear($runc, $iface);
+		}
+
+		delete $runc->{'split'}{$p};
+
+		# add stub for unsplit interface
+		$dev =~ s/s0$//;
+		$runc->{'iface'}{$p} //= {
+			'name' => $dev,
+			'qdisc' => { 'ingress' => 0 },
+		};
+		defined $toadd->{$p} and $togetport = 1;
+	}
+	# reread ports if we need to resplit them
+	$togetport and run_port_names($runc);
+	# then split
+	foreach my $p (sort keys %$toadd) {
+		my $dl = $runc->{'iface'}{$p}{'devlink'};
+		my $dev = $runc->{'iface'}{$p}{'name'};
+		defined $dl and defined $dev or die("resplit for $p is not supported in show mode");
+		my $n = $newc->{'split'}{$p};
+		
+		devlink("port split $dl count $n");
+
+		# update runc with new interfaces
+
+		$runc->{'split'}{$p} = $n;
+		iface_clear($runc, $p);
+
+		foreach my $x (0..($n - 1)) {
+			$runc->{'iface'}{"$p/$x"} //= {
+				'name' => "${dev}s${x}",
+				'qdisc' => { 'ingress' => 0 },
+			};
+		}
+	}
+
+	# update qdisc
+	foreach my $iface (sort keys %{$runc->{'iface'}}) {
+		$iface =~ /^port / or next;
+		my $dev = conf_ifdev($runc, $iface);
+		my $rq = ($runc->{'iface'}{$iface}{'qdisc'}{'ingress'} // 1);
+		my $nq = ($newc->{'iface'}{$iface}{'qdisc'}{'ingress'} // 1);
+		$rq == $nq and next;
+		if ($nq) {
+			tc("qdisc add dev $dev ingress_block 100 ingress");
+			delete $runc->{'iface'}{$iface}{'qdisc'}{'ingress'};
+		} else {
+			tc("qdisc del dev $dev ingress");
+			$runc->{'iface'}{$iface}{'qdisc'}{'ingress'} = $nq;
+		}
+	}
+
+	# add interfaces
+	($_, $_, $toadd) = set_diff(hash_keys($runc->{'iface'}), hash_keys($newc->{'iface'}));
+	foreach my $iface (sortiface keys %$toadd) {
+		my $dev = conf_ifdev($newc, $iface);
+
+		if ($iface =~ /^bond /) {
+			# add bond interfaces
+			my $opt = '';
+			my $b = $newc->{'bond'}{$iface};
+			foreach my $k (sort keys %$b) {
+				$opt .= ' '.$k.' '.$b->{$k};
+			}
+			ip("link add name $dev type bond$opt");
+			$runc->{'bond'}{$iface} = dclone($b);
+		} elsif ($iface =~ /^vrf /) {
+			# add vrf interfaces
+			my $v = $newc->{'vrf'}{$iface};
+			ip("link add name $dev type vrf table ".$v->{'table'});
+			$runc->{'bond'}{$iface} = dclone($b);
+		} elsif ($iface =~ /^loopback /) {
+			# add loopback interfaces
+			ip("link add name $dev type dummy");
+		} elsif ($iface eq 'switch') {
+			# add switch interface
+			ip("link add name $dev type bridge vlan_filtering 1");
+			# default config after creation
+			$runc->{'switch'}{'switch'} = {
+				'native' => { 1 => 1 },
+			};
+		} else {
+			next;
+		}
+
+		# reach here if we added something
+		ip("link set dev $dev down");
+		$runc->{'iface'}{$iface} = {
+			'name' => $dev,
+			'down' => 1,
+		};
+		delete $toadd->{$iface};
+	}
+	# masters to switch must be set before creating vlans
+	# mellanox does not allow to add bridge as first master
+	# if there are vlans created already
+	$c = $toadd; # keep interfaces left to add
+	$a = conf_iface_map($runc, 'master');
+	$b = conf_iface_map($newc, 'master');
+	($_, $_, $toadd) = set_diff($a, $b);
+	foreach my $m (sortiface keys %$toadd) {
+		$m =~ /^(?<iface>.*)!(?<master>.*)$/ or die("oops map master: $m");
+		my ($iface, $master) = ($+{'iface'}, $+{'master'});
+		defined $runc->{'iface'}{$iface} or next;
+		iface_set_master($runc, $iface, $master);
+	}
+	$toadd = $c;
+	# add vlan interfaces
+	foreach my $iface (sortiface keys %$toadd) {
+		my $dev = conf_ifdev($newc, $iface);
+
+		if ($iface =~ /^vlan (?<vid>\d+)$/) {
+			my $vid = $+{'vid'};
+			my $sw = conf_ifdev($runc, 'switch');
+			ip("link add link $sw name $dev type vlan id $vid");
+			ip("link set dev $dev down");
+			$runc->{'iface'}{$iface} = {
+				'name' => $dev,
+				'base' => 'switch',
+				'down' => 1,
+			};
+			delete $toadd->{$iface};
+		}
+	}
+	(keys %$toadd) == 0 or die('oops interfaces to add: '.join(',', keys %$toadd));
+
+	# add master links
+	$a = conf_iface_map($runc, 'master');
+	$b = conf_iface_map($newc, 'master');
+	($_, $_, $toadd) = set_diff($a, $b);
+	foreach my $m (sortiface keys %$toadd) {
+		$m =~ /^(?<iface>.*)!(?<master>.*)$/ or die("oops map master: $m");
+		iface_set_master($runc, $+{'iface'}, $+{'master'});
+	}
+
+	# configure bridge
+	$a = hash_keys($runc->{'switch'});
+	$b = hash_keys($newc->{'switch'});
+	($todel, $tochg, $toadd) = set_diff($a, $b);
+	# delete completely
+	foreach my $iface (sort keys %$todel) {
+		my $sw = $runc->{'switch'}{$iface};
+		foreach my $id (sort keys %{$sw->{'native'} // {}}) {
+			vlan_del($runc, $iface, $sw->{'native'}, 0);
+		}
+		foreach my $id (sort keys %{$sw->{'tag'} // {}}) {
+			vlan_del($runc, $iface, $id, 1);
+		}
+		delete $runc->{'switch'}{$iface};
+	}
+	# add new full interface
+	foreach my $iface (sort keys %$toadd) {
+		my $sw = $newc->{'switch'}{$iface};
+		foreach my $id (sort keys %{$sw->{'native'} // {}}) {
+			vlan_add($runc, $iface, $sw->{'native'}, 0);
+		}
+		foreach my $id (sort keys %{$sw->{'tag'} // {}}) {
+			vlan_add($runc, $iface, $id, 1);
+		}
+	}
+	# compare change in common interfaces
+	foreach my $iface (sort keys %$tochg) {
+		my $rsw = $runc->{'switch'}{$iface};
+		my $nsw = $newc->{'switch'}{$iface};
+		# handle native delete
+		($todel, $_, $toadd) = set_diff($rsw->{'native'} // {}, $nsw->{'native'} // {});
+		if ((keys %$todel) + (keys %$toadd) > 0) {
+			# if there some changes in native, flush completely
+			foreach my $id (sort keys %{$rsw->{'native'} // {}}) {
+				vlan_del($runc, $iface, $id, 0);
+			}
+		}
+		# handle tag delete
+		($todel, $_, $toadd) = set_diff($rsw->{'tag'} // {}, $nsw->{'tag'} // {});
+		foreach my $id (sort keys %$todel) {
+			vlan_del($runc, $iface, $id, 1);
+		}
+		# native add
+		($_, $_, $toadd) = set_diff($rsw->{'native'} // {}, $nsw->{'native'} // {});
+		foreach my $id (sort keys %$toadd) {
+			vlan_add($runc, $iface, $id, 0);
+		}
+		# tag add
+		($_, $_, $toadd) = set_diff($rsw->{'tag'} // {}, $nsw->{'tag'} // {});
+		foreach my $id (sort keys %$toadd) {
+			vlan_add($runc, $iface, $id, 1);
+		}
+	}
+	
+	# link up/down
+	$a = [grep {
+		($runc->{'iface'}{$_}{'down'} //= 0) == 1
+	} keys %{$runc->{'iface'}}];
+	$b = [grep {
+		($newc->{'iface'}{$_}{'down'} //= 0) == 1
+	} keys %{$newc->{'iface'}}];
+	# add undefined port interfaces as down
+	push @$b, (grep {
+		/^port / and not defined $newc->{'iface'}{$_}
+	} keys %{$runc->{'iface'}});
+	# find difference
+	($todel, $_, $toadd) = set_diff(array2set($a), array2set($b));
+	# down interfaces
+	foreach my $iface (reverse sortiface keys %$toadd) {
+		my $dev = conf_ifdev($runc, $iface);
+		ip("link set dev $dev down");
+		$runc->{'iface'}{$iface}{'down'} = 1;
+	}
+	# up interfaces
+	foreach my $iface (sortiface keys %$todel) {
+		my $dev = conf_ifdev($runc, $iface);
+		ip("link set dev $dev up");
+		delete $runc->{'iface'}{$iface}{'down'};
+	}
+
+	# add addresses
+	$a = hash_keys($runc->{'addr'});
+	$b = hash_keys($newc->{'addr'});
+	# there should be no addresses to delete at this point
+	($_, $tochg, $toadd) = set_diff($a, $b);
+	foreach my $iface (sort keys %{set_union($tochg, $toadd)}) {
+		my $dev = conf_ifdev($runc, $iface);
+		foreach my $ver (sort keys %{$newc->{'addr'}{$iface}}) {
+			$a = hash_keys($runc->{'addr'}{$iface}{$ver} // {});
+			$b = hash_keys($newc->{'addr'}{$iface}{$ver});
+			($_, $_, $c) = set_diff($a, $b);
+			foreach my $ip (sort keys %$c) {
+				my $opt = ip_ver_opt($ver);
+				# add nodad to mark managed ipv6 link-local addr
+				my $addr = $ip;
+				$addr =~ s:/.*$::;
+				my $flag = '';
+				if ($ver eq 'ipv6' and find_ip_net6($addr, @ipv6_linklocal)) {
+					$flag = ' nodad';
+				}
+				ip("$opt address add $ip$flag dev $dev");
+				$runc->{'addr'}{$iface}{$ver}{$ip} = 1;
+			}
+		}
+	}
+
+	# update routes
+	# first flush old tables
+	($todel, $_, $_) = set_diff(hash_keys($runc->{'route'}), hash_keys($newc->{'route'}));
+	foreach my $t (sort keys %$todel) {
+		foreach my $f (sort keys %{$runc->{'route'}{$t}}) {
+			my $opt = ip_ver_opt($f);
+			ip("$opt route flush table $t proto $route_proto");
+		}
+		delete $runc->{'route'}{$t};
+	}
+	# now look for changes
+	foreach my $t (sort keys %{$newc->{'route'}}) {
+		$runc->{'route'}{$t} //= {};
+		$a = hash_keys($runc->{'route'}{$t});
+		$b = hash_keys($newc->{'route'}{$t});
+		($todel, $_, $_) = set_diff($a, $b);
+		# flush missing families
+		foreach my $f (sort keys %$todel) {
+			my $opt = ip_ver_opt($f);
+			ip("$opt route flush table $t proto $route_proto");
+			delete $runc->{'route'}{$t}{$f};
+		}
+		# compare families
+		foreach my $f (sort keys %$b) {
+			$runc->{'route'}{$t}{$f} //= {};
+			my $opt = ip_ver_opt($f);
+			$a = $runc->{'route'}{$t}{$f};
+			$b = $newc->{'route'}{$t}{$f};
+			# compare routes
+			($todel, $toadd) = hash_diff($a, $b);
+			# delete routes
+			foreach my $pfx (sort keys %$todel) {
+				$pfx = pfxkey2opt($pfx, 1);
+				ip("$opt route flush exact $pfx table $t proto $route_proto");
+				delete $a->{$pfx};
+			}
+			# add routes
+			foreach my $pfx (sort keys %$toadd) {
+				route_add($runc, $t, $f, $pfx, $b->{$pfx});
+			}
+		}
+	}
+}
+
+if (@ARGV >= 1) {
+	if ($ARGV[0] eq '-s') {
+		@ARGV != 1 and die('option "-s" does not accept parameters');
+		# show current filters
+		my $runconf = run_get_config();
+		print dump_conf($runconf);
+		exit(0);
+	} elsif ($ARGV[0] eq '-n') {
+		# load new config
+		# shift arg
+		shift @ARGV;
+	} elsif ($ARGV[0] eq '-l') {
+		# load new config
+		# set write mode
+		$_write_mode = 1;
+		# shift arg
+		shift @ARGV;
+	} elsif ($ARGV[0] eq '-c') {
+		# check new config
+		shift @ARGV;
+		my $newconf = read_config();
+		exit(0);
+	} else {
+		die('unsupported parameter');
+	}
+} else {
+	print STDERR
+		"Usage:\n".
+		"\t$0 -s          # show running config\n".
+		"\t$0 -c [config] # check config\n".
+		"\t$0 -n [config] # load new config (only show cmds)\n".
+		"\t$0 -l [config] # load new config (apply commands)\n";
+	exit(1);
+}
+
+my $newconf = read_config();
+
+my $runconf = run_get_config([map { $newconf->{'vrf'}{$_}{'table'} } keys %{$newconf->{'vrf'}}]);
+
+update_config($runconf, $newconf);

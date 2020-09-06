@@ -1,0 +1,1068 @@
+#!/usr/bin/perl -w
+
+use Storable qw(dclone);
+
+my $_write_mode = 0;
+
+sub in_range {
+	my ($a, $min, $max) = @_;
+	return ($a >= $min and $a <= $max);
+}
+
+sub get_uint_parser {
+	my ($min, $max) = @_;
+	return sub {
+		my ($a) = @_;
+		($a =~ /^\d+$/) or return undef;
+		in_range($a, $min, $max) or return undef;
+		return int($a);
+	};
+}
+
+sub get_word_uint_parser {
+	my $f = get_uint_parser(@_);
+	return sub {
+		my ($a) = @_;
+		($a =~ /^\d+$/) and return &$f($a);
+		($a =~ /^[-\w]+$/) or return undef;
+		return $a;
+	};
+}
+
+sub parse_uint {
+	my ($a) = @_;
+	($a =~ /^\d+$/) or return undef;
+	return int($a);
+}
+
+sub parse_word {
+	my ($a) = @_;
+	($a =~ /^[-\w]+$/) or return undef;
+	($a =~ /^\d+$/) and return int($a);
+	return $a;
+}
+
+sub is_ipv6 {
+	my ($a) = @_;
+	return ($a =~ m!^[0-9a-fA-F:]*:[0-9a-fA-F:\./]*$!)
+}
+
+sub parse_prefix4 {
+	my ($a) = @_;
+	$a =~ /^(?<o1>\d+)\.(?<o2>\d+)\.(?<o3>\d+)\.(?<o4>\d+)(\/(?<mask>\d+))?$/ or return undef;
+	my @b = map { int($+{"o$_"}) } (1..4);
+	my $mask = '';
+	if (($+{'mask'} // '') ne '') {
+		my $m = int($+{'mask'});
+		in_range($m, 0, 32) or return undef;
+		$m < 32 and $mask = "/$m";
+	}
+	foreach my $o (@b) { in_range($o, 0, 255) or return undef; }
+	return join('.', @b).$mask;
+}
+
+sub parse_prefix6 {
+	my ($a) = @_;
+	my $mask = '';
+
+	# check mask
+	if ($a =~ s!/(?<mask>\d+)$!!) {
+		my $m = int($+{'mask'});
+		in_range($m, 0, 128) or return undef;
+		($m < 128) and $mask = "/$m";
+	}
+	# convert ipv4-mapped address
+	if ($a =~ s/:(?<o1>\d+)\.(?<o2>\d+)\.(?<o3>\d+)\.(?<o4>\d+)$//) {
+		my @b = map { int($+{"o$_"}) } (1..4);
+		foreach my $o (@b) { in_range($o, 0, 255) or return undef; }
+		$a .= ':'.sprintf("%02x", $b[0]).sprintf("%02x", $b[1]).
+		      ':'.sprintf("%02x", $b[2]).sprintf("%02x", $b[3]);
+	}
+	# drop leading zeroes
+	$a = join(':', map { s/^0+(.+)$/$1/; tr/A-F/a-f/; $_; } split(/:/, $a, -1));
+	# expand ::
+	if ($a =~ /^(?<left>.*)::(?<right>.*)$/) {
+		my @l = split(/:/, $+{'left'}, -1);
+		my @r = split(/:/, $+{'right'}, -1);
+		my $nl = @l;
+		my $nr = @r;
+		($nl + $nr) < 8 or return undef;
+		$a = join(':', @l, map({ '0' } (1..(8-$nl-$nr))), @r);
+	}
+	# check syntax
+	my @b = split(/:/, $a, -1);
+	@b == 8 or return undef;
+	foreach my $s (@b) {
+		$s =~ /^[0-9a-f]{1,4}$/ or return undef;
+	}
+	# find longest zero sequence
+	my ($seq_max_start, $seq_max_len, $seq_start, $seq_len);
+	$seq_max_len = 0;
+	$seq_start = '';
+	foreach my $p ((0..7)) {
+		if ($b[$p] eq '0') {
+			if ($seq_start eq '') {
+				$seq_start = $p;
+				$seq_len = 1;
+			} else {
+				if (++$seq_len >= $seq_max_len) {
+					$seq_max_len = $seq_len;
+					$seq_max_start = $seq_start;
+				}
+			}
+		} else {
+			$seq_start = '';
+			$seq_len = 0;
+		}
+	}
+	# replace zero sequence with ::
+	if ($seq_max_len > 1) {
+		$a = join(':', @b[0 .. ($seq_max_start-1)]).'::'.join(':', @b[($seq_max_start+$seq_max_len) .. 7]);
+	}
+	# address is ready
+	return "$a$mask";
+}
+
+sub parse_prefix {
+	my ($a) = @_;
+	is_ipv6($a) and return parse_prefix6($a);
+	return parse_prefix4($a);
+}
+
+sub parse_ipproto {
+	my ($a) = @_;
+	$a =~ /^tcp|udp|sctp|icmp|icmpv6$/ and return $a;
+	if ($a =~ /^(0[xX])?[0-9a-fA-F]+$/) {
+		$a = hex($a);
+	} else {
+		return undef;
+	}
+	$a = int($a);
+	in_range($a, 0, 255) or return undef;
+	my %known_proto = (
+		1 => 'icmp',
+		6 => 'tcp',
+		17 => 'udp',
+		58 => 'icmpv6',
+		132 => 'sctp',
+	);
+	defined $known_proto{$a} and return $known_proto{$a};
+	return sprintf('0x%02x', $a);
+}
+
+my %filter_keys = (
+	'dst_ip' => \&parse_prefix,
+	'src_ip' => \&parse_prefix,
+	'dst_port' => get_uint_parser(0, 65535),
+	'src_port' => get_uint_parser(0, 65535),
+	#'eth_type' => qr/^ipv[46]$/,
+	'ip_proto' => \&parse_ipproto,
+	'ip_ttl' => get_uint_parser(0, 255),
+);
+
+my @prio_keys_a = (
+	'eth_type',
+	'ip_proto',
+	'src_ip',
+	'src_port',
+	'dst_ip',
+	'dst_port',
+	'ip_ttl',
+);
+
+my %keyprio = ();
+@keyprio{@prio_keys_a} = 0..$#prio_keys_a;
+
+sub parse_key {
+	my ($key, $val) = @_;
+	my $f = $filter_keys{$key};
+	defined $f or return undef;
+	my $r = ref($f);
+	if ($r eq '') {
+		$val eq $f or return undef;
+		return $val;
+	} elsif ($r eq 'CODE') {
+		return &$f($val);
+	} elsif ($r eq 'Regexp') {
+		$val =~ /$f/ or return undef;
+		return $val;
+	}
+}
+
+sub parse_ref {
+	my ($s) = @_;
+	$s =~ /^\[([-\w]+)\]$/ or return undef;
+	my $v = $1;
+	$v =~ /\[|\]/ and return undef;
+	$v =~ /^\d+$/ and return undef;
+	return $v;
+}
+
+sub next_word {
+	my ($s) = @_;
+	$s =~ /^\s*(?<word>\S+)(?<tail>.*)$/ or return (undef, '');
+	return ($+{'word'}, $+{'tail'});
+}
+
+sub tc {
+	my $opt = "@_";
+	if ($opt =~ /^\S+\s+show(\s|$)/) {
+		my @res = `/root/bin/tc $opt`;
+		$? and die('run tc failed');
+		return @res;
+	} elsif ($_write_mode) {
+		print STDERR "$opt\n";
+		my @res = `/root/bin/tc $opt`;
+		$? and die('run tc failed');
+		return @res;
+	} else {
+		print "/root/bin/tc $opt\n";
+	}
+}
+
+sub bridge {
+	return `/root/bin/bridge @_`;
+}
+
+sub tc_add {
+	my ($ch, $pref, $body) = @_;
+	$body =~ s/protocol (?<proto>\S+) //;
+	my $proto = $ch eq '0' ? '802.1q' : ($+{'proto'} // 'ip');
+	return tc("filter add block 100 protocol $proto chain $ch pref $pref flower $body");
+}
+
+sub tc_del {
+	my ($ch, $pref) = @_;
+	return tc("filter del block 100 chain $ch pref $pref");
+}
+
+sub tc_replace {
+	my ($ch, $pref, $body) = @_;
+	tc_del($ch, $pref);
+	tc_add($ch, $pref, $body);
+}
+
+sub tc_del_chain {
+	my ($ch) = @_;
+	return tc("filter del block 100 chain $ch");
+}
+
+sub run_ports_get {
+	my %ports = ();
+	foreach my $l (tc('qdisc show')) {
+		$l =~ /^qdisc (?<qdisc>\S+) .* dev (?<p>enp\d+s\d+np\d\w*) .*/ or next;
+		my $qdisc = $+{'qdisc'};
+		my $p = $+{'p'};
+		$qdisc eq 'ingress' or next;
+		$l =~ / ingress_block 100 / or die("No ingress_block 100 on port $p");
+		$ports{$p} = 1;
+	}
+	return \%ports;
+}
+
+sub all_ports_get {
+	my %ports = ();
+	foreach my $p (glob '/sys/class/net/enp*s*np*') {
+		$p =~ s!.*/!!;
+		$ports{$p} = 1;
+        }
+	return \%ports;
+}
+
+sub run_chains_get {
+	my %chains = ();
+	my %rule = ();
+
+	foreach my $l (tc('filter show block 100')) {
+		$l =~ s/\s+$//;
+		if ($l eq '') {
+			# Commit rule
+
+			(%rule) or die("No rule to commit");
+			$rule{'in_hw'} or die("Rule without in_hw");
+
+			if (($chains{$rule{'chain'}}{'ruleid'}{$rule{'pref'}}{'handle'} // '') ne '') {
+				$chains{$rule{'chain'}}{'ruleid'}{$rule{'pref'}} = {
+					'proto' => $rule{'proto'},
+					'handle' => 'multiple',
+				};
+			} else {
+				$chains{$rule{'chain'}}{'ruleid'}{$rule{'pref'}} = {
+					'proto' => $rule{'proto'},
+					'handle' => $rule{'handle'},
+					'keys' => $rule{'keys'} // {},
+					'action' => $rule{'action'},
+				};
+			}
+
+			%rule = ();
+			next;
+		} elsif ($l =~ /^filter protocol .*/) {
+			# Some header
+
+			$l =~ /^filter protocol (?<proto>ip|ipv6|802\.1Q) pref (?<pref>\d+) flower chain (?<chain>\d+)(?<tail>.*)$/ or die("Can not parse line: $l");
+			my $proto = $+{'proto'};
+			my $pref = $+{'pref'};
+			my $chain = $+{'chain'};
+			my $tail = $+{'tail'};
+
+			(%rule) and die("Previous rule is not commited: $l");
+			($proto eq '802.1Q' and $chain eq 0) or ($proto =~ /^ip(v6)?$/ and $chain > 0) or die("Unsupported proto and chain combination: chain '$chain' proto '$proto'");
+
+			if ($tail eq '') {
+				# Rule header
+				$chains{$chain}{'ruleid'}{$pref} = { 'proto' => $proto };
+				next;
+			} else {
+				# Rule handle
+				(($chains{$chain}{'ruleid'}{$pref}{'proto'} // '') ne $proto) and die("Rule handle does not match header: $l");
+				$tail =~ /^ handle (?<handle>\S+)$/ or die("Bad rule handle: $l");
+				my $handle = $+{'handle'};
+				%rule = (
+					'chain' => $chain,
+					'pref' => $pref,
+					'proto' => $proto,
+					'handle' => $handle,
+				);
+				next;
+			}
+		} elsif ($l =~ /^  (?<key>\S+)( (?<param>.*))?$/) {
+			# Filter expression
+			my ($key, $param) = ($+{'key'}, $+{'param'});
+
+			if (defined $filter_keys{$key}) {
+				$rule{'proto'} =~ /^ip(v6)?$/ or die("Bad protocol '${rule{'proto'}}' for key '$key'");
+				my $p = parse_key($key, $param) or die("Can not parse or unsupported key '$key' value '$param'");
+				$rule{'keys'}{$key} = $p;
+				next;
+			} elsif ($key =~ /^eth_type$/) {
+				next;
+			} elsif ($key =~ /^in_hw|skip_sw$/) {
+				$rule{$key} = 1;
+				next;
+			} elsif ($key eq 'vlan_id') {
+				$rule{'proto'} eq '802.1Q' or die("Bad protocol '${rule{'proto'}}' for key '$key'");
+				$param =~ /^\d+$/ or die("Bad '$key' value '$param'");
+				$rule{'keys'}{$key} = $param;
+				next;
+			} else {
+				die("Unsupported filter key '$key'");
+			}
+		} elsif ($l =~ /^\taction (.*)$/) {
+			# Action
+			$1 =~ /^order 1: gact action (?<act>.*)$/ or die("Unsupported action line: $l");
+			my $act = $+{'act'};
+			if ($act =~ /^(drop|pass)$/) {
+				$rule{'action'} = $act;
+				next;
+			} elsif ($act =~ /^goto chain (\d+)$/) {
+				my $goto = $1;
+				# internal representation without "chain" word
+				$rule{'action'} = "goto $1";
+				$chains{$rule{'chain'}}{'refers'}{$goto} = 1;
+				$chains{$goto}{'referedby'}{$rule{'chain'}} = 1;
+				next;
+			} else {
+				die("Unsupported action: $l");
+			}
+		} elsif ($l =~ /^\t .*$/) {
+			# Other attributes
+			next;
+		} else {
+			die("Unsupported line: $l");
+		}
+	}
+	(%rule) and die("Rule has not been commited");
+
+	return \%chains;
+}
+
+sub run_get_config {
+	my $chains = run_chains_get();
+	my %cfg = ('vlanpref' => {});
+
+	if (defined $chains->{'0'}) {
+		my $num_pass = 0;
+		my $max_pref = 0;
+
+		foreach my $pref (keys %{$chains->{'0'}{'ruleid'}}) {
+			my $rule = $chains->{'0'}{'ruleid'}{$pref};
+
+			($pref > $max_pref) and $max_pref = $pref;
+			$rule->{'proto'} eq '802.1Q' or die("Bad rule proto in vlan chain");
+			if ($rule->{'action'} =~ /^goto (?<chain>.*)$/) {
+				my $chain = $+{'chain'};
+				(keys %{$rule->{'keys'}}) == 1 or die("Bad filter rule (multiple keys) in vlan chain");
+				defined $rule->{'keys'}{'vlan_id'} or die("Bad filter rule (no vlan_id key) in vlan chain");
+				defined $cfg{'vlan'}{$rule->{'keys'}{'vlan_id'}} and die("Vlan is refered several times: ". $rule->{'keys'}{'vlan_id'});
+				$cfg{'vlan'}{$rule->{'keys'}{'vlan_id'}} = $chain;
+				#$cfg{'chain'}{$chain} = $chains->{$chain};
+				$cfg{'vlanpref'}{$pref} = $rule->{'keys'}{'vlan_id'};
+			} elsif ($rule->{'action'} =~ 'pass') {
+				(keys %{$rule->{'keys'} // {}}) == 0 or die("Pass rule in vlan chain should not have filter");
+				$cfg{'vlanpref'}{$pref} = 'pass';
+				++$num_pass;
+			} else {
+				die("Bad action for proto 802.1Q rule: ".$rule->{'action'});
+			}
+		}
+
+		$num_pass == 1 or die("No or serveral pass actions in vlan chain");
+		$chains->{'0'}{'ruleid'}{$max_pref}{'action'} eq 'pass' or die("Last rule of vlan chain should be pass");
+	}
+
+	delete $chains->{'0'};
+
+	# convert rule id chains to rule array
+	foreach my $c (keys %$chains) {
+		my @rule = ();
+		my @ids = keys %{$chains->{$c}{'ruleid'}};
+		foreach my $id (sort {$a <=> $b} @ids) {
+			my $r = $chains->{$c}{'ruleid'}{$id};
+			$r->{'handle'} eq 'multiple' or delete $r->{'handle'};
+			push @rule, $chains->{$c}{'ruleid'}{$id};
+		}
+		delete $chains->{$c}{'ruleid'};
+		$chains->{$c}{'rule'} = \@rule;
+	}
+
+	$cfg{'chain'} = $chains;
+
+	return \%cfg;
+}
+
+sub cmp_generic {
+	my ($a, $b) = @_;
+	my $ra = ref($a);
+	$ra ne ref($b) and return 0;
+	if ($ra eq '') {
+		return ($a eq $b);
+	} elsif ($ra eq 'ARRAY') {
+		my @aa = @$a;
+		my @ab = @$b;
+		scalar @aa != scalar @ab and return 0;
+		while (@aa > 0 and @ab > 0) {
+			my $ea = shift @aa;
+			my $eb = shift @ab;
+			cmp_generic($ea, $eb) or return 0;
+		}
+		return 1;
+	} elsif ($ra eq 'HASH') {
+		my @ka = sort keys %$a;
+		my @kb = sort keys %$b;
+		cmp_generic(\@ka, \@kb) or return 0;
+		foreach my $k (@ka) {
+			cmp_generic($a->{$k}, $b->{$k}) or return 0;
+		}
+		return 1;
+	} else {
+		die("cmp_generic: unsupported ref: $ra");
+	}
+}
+
+sub cmp_set {
+	my ($a, $b) = @_;
+	ref($a) eq 'HASH' or return 0;
+	ref($b) eq 'HASH' or return 0;
+	my @ka = sort keys %$a;
+	my @kb = sort keys %$b;
+	return cmp_generic(\@ka, \@kb);
+}
+
+sub array2set {
+	my ($a) = @_;
+	my $r = {};
+	foreach (@$a) { $r->{$_} = 1; }
+	return $r;
+}
+
+sub set_join {
+	my @ss = @_;
+	my $r = {};
+	foreach my $s (@ss) {
+		foreach (keys %$s) { $r->{$_} = 1; }
+	}
+	return $r;
+}
+
+sub set_sub {
+	my ($a, $b) = @_;
+	my $r = {};
+	foreach my $v (keys %$a) {
+		defined $b->{$v} and next;
+		$r->{$v} = 1;
+	}
+	return $r;
+}
+
+sub cmp_rule {
+	my ($a, $b) = @_;
+	(($a->{'handle'} // '') eq 'multiple' or ($b->{'handle'} // '') eq 'multiple') and return 0;
+	return cmp_generic($a, $b);
+}
+
+sub cmp_chain {
+	my ($a, $b) = @_;
+	my @ra = @{$a->{'rule'}};
+	my @rb = @{$b->{'rule'}};
+	scalar @ra == scalar @rb or return 0;
+	while (@ra > 0) {
+		my $ela = shift @ra;
+		my $elb = shift @rb;
+		cmp_rule($ela, $elb) or return 0;
+	}
+	return 1;
+}
+
+sub sort_topo {
+	my ($chains) = @_;
+	my @r = ();
+	my %a = ();
+	foreach my $k (keys %$chains) {
+		my $refby = array2set([keys %{$chains->{$k}{'referedby'} // {}}]);
+		delete $refby->{'0'};
+		$a{$k} = $refby;
+	}
+	while (keys %a > 0) {
+		my $k;
+		foreach my $x (keys %a) {
+			if (keys %{$a{$x}} == 0) {
+				$k = $x;
+				last;
+			}
+		}
+		($k // '') eq '' and die("sort_topo: graph with cyclical dependency");
+		push(@r, $k);
+		delete $a{$k};
+		foreach my $x (keys %a) { delete $a{$x}{$k}; }
+	}
+	return \@r;
+}
+
+sub chain_drop {
+	my ($chains, $drop) = @_;
+	my $dropq = $drop;
+	$dropq =~ /^\d+$/ or $dropq = "[$dropq]";
+
+	foreach my $cn (keys %$chains) {
+		my $c = $chains->{$cn};
+		defined $c->{'referedby'} and delete $c->{'referedby'}{$drop};
+		defined $c->{'refers'}{$drop} and die("Chain $cn refers to $drop being deleted");
+		foreach my $r (@{$c->{'rule'}}) {
+			$r->{'action'} =~ /^goto \Q$dropq\E$/ and die("Chain $cn has goto to $drop being deleted");
+		}
+	}
+
+	delete $chains->{$drop};
+}
+
+sub parse_config {
+	my ($text) = @_;
+	my @lines = map({ chomp; $_; } split(/^/m, $text));
+
+	my %chain = ();
+	my $curchain = '';
+
+	foreach my $l (@lines) {
+		my $proto_auto;
+		my $proto;
+
+		# remove comments and trailing spaces
+		$l =~ s/\s*(#.*)$//;
+		# skip empty line
+		$l eq '' and next;
+		# remove beginning spaces
+		$l =~ s/^\s+//;
+
+		# check if new chain
+		if (parse_ref($l)) {
+			$curchain = parse_ref($l);
+			defined $chain{$curchain} or $chain{$curchain} = {'rule' => []};
+			next;
+		}
+
+		# parse filter line
+		$curchain eq '' and die("Undefined or unsupported chain for filter line: $l");
+
+		# rule parameters to fill
+		my $action;
+		my %keys = ();
+
+		# loop variables
+		my $t = $l;
+		my $w;
+
+		while (1) {
+			# get next word from the string
+			($w, $t) = next_word($t);
+			defined $w or last;
+
+			if ($w eq 'action') {
+				defined $action and die("Action is defined twice in: $l");
+				($w, $t) = next_word($t);
+
+				if ($w =~ /^(drop|pass)$/) {
+					$action = $w;
+				} elsif ($w eq 'goto') {
+					($w, $t) = next_word($t);
+					defined $w or die("Goto destination is not defined in: $l");
+					my $r = parse_ref($w) or die("Bad goto destination '$w' in: $l");
+					$action = "goto [$r]";
+				} else {
+					die("Unknown or unsupported action '$w' in: $l");
+				}
+			} elsif ($w =~ /^proto(col)?$/) {
+				($w, $t) = next_word($t);
+				defined $w or die("Protocol value is not defined in: $l");
+				defined $proto and die("Protocol is defined twice in: $l");
+				if ($w =~ /^ip(v4)?$/) {
+					$proto = 'ip';
+				} elsif ($w = 'ipv6') {
+					$proto = $w;
+				} else {
+					die("Unknown or unsupported protocol '$w' in: $l");
+				}
+			} elsif (defined $filter_keys{$w}) {
+				my $key = $w;
+				($w, $t) = next_word($t);
+				defined $w or die("Key '$key' value is not defined in: $l");
+				my $p = parse_key($key, $w) or die("Can not parse or unsupported key '$key' value '$w' in: $l");
+				defined $keys{$key} and die("Key '$key' is defined twice in: $l");
+				$keys{$key} = $p;
+
+				# for ip address try to guess protocol
+				if ($key =~ /^(dst|src)_ip$/) {
+					my $t = is_ipv6($p) ? 'ipv6' : 'ip';
+					defined $proto_auto and $t ne $proto_auto and die("Address types mistmatch: $proto_auto and $t in: $l");
+					$proto_auto = $t;
+				}
+
+				next;
+			} else {
+				die("Unknown word '$w' in: $l");
+			}
+		}
+
+		defined $action or die("Action is not defined in: $l");
+
+		# Check for protocol mistmatch
+		defined $proto and defined $proto_auto and $proto ne $proto_auto and die("Protocol ($proto) mistmatch with address type ($proto_auto) in: $l");
+		$proto //= $proto_auto // 'ip';
+		#$keys{'eth_type'} //= 'ipv4';
+
+		# fail on icmp protocol for ipv6 if mistaken
+		if ($proto eq 'ipv6' and ($keys{'ip_proto'} // '') eq 'icmp') {
+			die("ip_proto icmp is not supported with ipv6 in: $l");
+		}
+
+		push(@{$chain{$curchain}{'rule'}}, {
+			'action' => $action,
+			'proto' => $proto,
+			'keys' => \%keys,
+		});
+	}
+
+	# add default drop at the end of chains
+	# ipv4
+	foreach my $ch (keys %chain) {
+		# skip if some rule is unconditional
+		my $found = 0;
+		# check ipv4 rules
+		foreach my $r (@{$chain{$ch}{'rule'}}) {
+			$r->{'proto'} eq 'ip' or next;
+			my $keys = $r->{'keys'};
+			if (keys %$keys == 0) {
+				$found = 1;
+				last;
+			}
+			#keys %$keys > 1 and next;
+			#defined $keys->{'eth_type'} and next;
+		}
+		$found and next;
+
+		# add drop to the end
+		push(@{$chain{$ch}{'rule'}}, {
+			'action' => 'drop',
+			'proto' => 'ip',
+			#'keys' => { 'eth_type' => 'ipv4' },
+			'keys' => {},
+		});
+	}
+	# ipv6
+	foreach my $ch (keys %chain) {
+		# skip if some rule is unconditional
+		my $found = 0;
+		# check ipv6 rules
+		foreach my $r (@{$chain{$ch}{'rule'}}) {
+			$r->{'proto'} eq 'ipv6' or next;
+			my $keys = $r->{'keys'};
+			if (keys %$keys == 0) {
+				$found = 1;
+				last;
+			}
+			#keys %$keys > 1 and next;
+			#defined $keys->{'eth_type'} and next;
+		}
+		$found and next;
+
+		# add drop to the end
+		push(@{$chain{$ch}{'rule'}}, {
+			'action' => 'drop',
+			'proto' => 'ipv6',
+			#'keys' => { 'eth_type' => 'ipv6' },
+			'keys' => {},
+		});
+	}
+
+	# check references
+	foreach my $ch (keys %chain) {
+		$ch =~ /^vlan\d+$/ and $chain{$ch}{'referedby'}{'0'} = 1;
+		foreach my $rule (@{$chain{$ch}{'rule'}}) {
+			# only goto rules are of interest
+			$rule->{'action'} =~ /^goto (.*)$/ or next;
+			my $r = parse_ref($1);
+
+			# check and add references
+			defined $chain{$r} or die("goto action to undefined chain '$r'");
+			$chain{$ch}{'refers'}{$r} = 1;
+			$chain{$r}{'referedby'}{$ch} = 1;
+		}
+	}
+
+	# drop unreachable chains
+	# sort_topo also checks for loops
+	foreach my $ch (@{ sort_topo(\%chain) }) {
+		# skip chains that are refered
+		defined $chain{$ch}{'referedby'}
+		and keys %{$chain{$ch}{'referedby'}} > 0
+		and next;
+		# drop chain that is not refered
+		chain_drop(\%chain, $ch);
+	}
+
+	# return config
+	return \%chain;
+}
+
+sub set_rename_elem {
+	my ($set, $from, $to) = @_;
+	if (defined $set->{$from}) {
+		delete $set->{$from};
+		$set->{$to} = 1;
+	}
+}
+
+sub chain_rename {
+	my ($conf, $from, $to) = @_;
+	my $chains = $conf->{'chain'};
+	my ($fromq, $toq) = ($from, $to);
+	$fromq =~ /^\d+$/ or $fromq = "[$fromq]";
+	$toq =~ /^\d+$/ or $toq = "[$toq]";
+
+	foreach my $cn (keys %$chains) {
+		my $c = $chains->{$cn};
+		defined $c->{'referedby'} and set_rename_elem($c->{'referedby'}, $from, $to);
+		defined $c->{'refers'} and set_rename_elem($c->{'refers'}, $from, $to);
+		foreach my $r (@{$c->{'rule'}}) {
+			$r->{'action'} =~ s/^goto \Q$fromq\E$/goto $toq/;
+		}
+	}
+
+	if (defined $chains->{$from}) {
+		$chains->{$to} = $chains->{$from};
+		delete $chains->{$from};
+	}
+
+	foreach my $v (keys %{$conf->{'vlan'}}) {
+		if ($conf->{'vlan'}{$v} eq $from) {
+			$conf->{'vlan'}{$v} = $to;
+		}
+	}
+}
+
+sub find_similar_chain {
+	my ($target, $chains) = @_;
+
+	foreach my $n (keys %$chains) {
+		# match chains only once
+		#defined $chains->{$n}{'_matched'} and next;
+
+		if (cmp_chain($target, $chains->{$n})) {
+			#$chains->{$n}{'_matched'} = 1;
+			return $n;
+		}
+	}
+
+	return undef;
+}
+
+sub chain_all_parent_ref {
+	my ($chains, $c) = @_;
+	my @parent = keys %{$chains->{$c}{'referedby'}};
+	my $res = {};
+	foreach my $r (@parent) {
+		# skip chain 0
+		$r eq '0' and next;
+		# recursive call
+		my $rec = array2set([chain_all_parent_ref($chains, $r)]);
+		$res->{$r} = 1;
+		$res = set_join($res, $rec);
+	}
+	return keys %$res;
+}
+
+sub match_chains {
+	my ($newconf, $runconf) = @_;
+	my $new = $newconf->{'chain'};
+	my $run = $runconf->{'chain'};
+	# match new chains from leaves
+	my @l = reverse @{ sort_topo($new) };
+	# set of skipped chains
+	my $skip = {};
+
+	foreach my $c (@l) {
+		$skip->{$c} and next;
+		my $o = find_similar_chain($new->{$c}, $run);
+		if (defined $o) {
+			# similar chain found, rename it in new config
+			chain_rename($newconf, $c, $o);
+		} else {
+			# chain not found, skip all parent references too
+			my @all_ref = chain_all_parent_ref($new, $c);
+			$skip->{$c} = 1;
+			$skip = set_join($skip, array2set([@all_ref]));
+		}
+	}
+
+	# return list of non-matched chains
+	return (keys %$skip);
+}
+
+sub dump_chains {
+	my ($conf) = @_;
+	$conf = dclone($conf);
+	my $s = '';
+
+	my %chain_rem = ();
+
+	foreach my $v (keys %{$conf->{'vlan'}}) {
+		$chain_rem{"vlan$v"} = $conf->{'vlan'}{$v};
+		chain_rename($conf, $conf->{'vlan'}{$v}, "vlan$v");
+	}
+
+	my $num = 0;
+	foreach my $c (keys %{$conf->{'chain'}}) {
+		$c =~ /^\d+$/ or next;
+		++$num;
+		$chain_rem{"c$num"} = $c;
+		chain_rename($conf, $c, "c$num");
+	}
+
+	my $chains = $conf->{'chain'};
+
+	foreach my $c (sort keys %$chains) {
+		my $rem = '';
+		defined $chain_rem{$c} and $rem = " # ".$chain_rem{$c};
+		$s .= "[$c]$rem\n\n";
+		foreach my $r (@{$chains->{$c}{'rule'}}) {
+			if (($r->{'handle'} // '') eq 'multiple') {
+				$s .= "# multiple handles\n";
+				next;
+			}
+			$s .= "proto ".$r->{'proto'};
+			foreach my $k (sort { $keyprio{$a} <=> $keyprio{$b} } keys %{$r->{'keys'}}) {
+				$k eq 'eth_type' and next;
+				$s .= " $k ".$r->{'keys'}{$k};
+			}
+			$s .= " action ".$r->{'action'}."\n";
+		}
+		$s .= "\n";
+	}
+
+	return $s;
+}
+
+sub set_ports_qdisc {
+	my $cur = run_ports_get();
+
+	my $all_ports = all_ports_get();
+
+	foreach my $p (sort keys %{ set_sub($all_ports, $cur) }) {
+		tc("qdisc add dev $p ingress_block 100 ingress");
+	}
+
+	# there should not be such now, but check
+	foreach my $p (sort keys %{ set_sub($cur, $all_ports) }) {
+		tc("qdisc del dev $p ingress");
+	}
+}
+
+if (@ARGV >= 1) {
+	if ($ARGV[0] eq '-s') {
+		@ARGV != 1 and die('option "-s" does not accept parameters');
+		# show current filters
+		my $runconf = run_get_config();
+		print dump_chains($runconf);
+		exit(0);
+	} elsif ($ARGV[0] eq '-n') {
+		# load new filters
+		# shift arg
+		shift @ARGV;
+	} elsif ($ARGV[0] eq '-l') {
+		# load new filters
+		# set write mode
+		$_write_mode = 1;
+		# shift arg
+		shift @ARGV;
+	} elsif ($ARGV[0] eq '-c') {
+		# check new config
+		shift @ARGV;
+		my $text = join('', <>);
+		$! and die('fail to read config');
+		my $newchain = parse_config($text);
+		exit(0);
+	} elsif ($ARGV[0] eq '-p') {
+		@ARGV != 1 and die('option "-p" does not accept parameters');
+		# set ports qdisc
+		$_write_mode = 1;
+		set_ports_qdisc();
+		exit(0);
+	} else {
+		die('unsupported parameter');
+	}
+} else {
+	print STDERR
+		"Usage:\n".
+		"\t$0 -s          # show running filters\n".
+		"\t$0 -c [config] # check filters config\n".
+		"\t$0 -n [config] # load new filters (only show cmds)\n".
+		"\t$0 -l [config] # load new filters (apply commands)\n".
+		"\t$0 -p [-n]     # only prepare ports\n";
+	exit(1);
+}
+
+my $runconf = run_get_config();
+
+my $text = join('', <>);
+my $newchain = parse_config($text);
+$! and die('fail to read config');
+my $newconf = { 'chain' => $newchain, 'vlan' => {} };
+
+foreach my $c (keys %$newchain) {
+	$c =~ /^vlan(?<vlan>\d+)$/ or next;
+	$newconf->{'vlan'}{$+{'vlan'}} = $c;
+}
+
+my @run_chains = keys %{$runconf->{'chain'}};
+my $missing = array2set([match_chains($newconf, $runconf)]);
+my $taken = array2set([@run_chains]);
+my $toadd = {};
+my $todelete = array2set([@run_chains]);
+
+# delete matched chains, only unneeded will be left
+foreach my $c (keys %$newchain) {
+	delete $todelete->{$c};
+}
+
+# assign numbers for missing chains
+my $num = 100;
+foreach my $c (keys %$missing) {
+	while (defined $taken->{"$num"}) { ++$num; }
+	$taken->{"$num"} = 1;
+	$toadd->{"$num"} = 1;
+	chain_rename($newconf, $c, "$num");
+}
+
+# update ports qdisc
+set_ports_qdisc();
+
+# add chains starting from leaves
+foreach my $c (reverse @{ sort_topo($newchain) }) {
+	# add only missing chains
+	$toadd->{$c} or next;
+
+	my $rule = $newchain->{$c}{'rule'};
+	my $pref = 0;
+	foreach my $r (@$rule) {
+		++$pref;
+		my $s = 'protocol '.$r->{'proto'};
+		foreach my $k (sort { $keyprio{$a} <=> $keyprio{$b} } keys %{$r->{'keys'}}) {
+			$s .= " $k ".$r->{'keys'}{$k};
+		}
+		if ($r->{'action'} =~ /^goto (?<goto>.*)$/) {
+			$s .= " action goto chain ".$+{'goto'};
+		} else {
+			$s .= " action ".$r->{'action'};
+		}
+		tc_add($c, $pref, $s);
+	}
+}
+
+# update vlans rules if needed
+# compare current vlan map with new
+if (not cmp_generic($runconf->{'vlan'}, $newconf->{'vlan'})) {
+	my $num = 0;
+	my $afterpass = 0;
+	my $runvlanpref = dclone($runconf->{'vlanpref'});
+
+	foreach my $vl (sort { $a <=> $b } (keys %{$newconf->{'vlan'}})) {
+		my $newch = $newconf->{'vlan'}{$vl};
+		my $runch = $runconf->{'vlan'}{$vl};
+		my $ready = 0;
+		while (1) {
+			# find next free pref
+			++$num;
+			if (defined $runvlanpref->{"$num"}) {
+				my $numvl = $runvlanpref->{"$num"};
+				if ($numvl eq $vl and $newch eq $runch) {
+					# do not need to recreate the rule
+					delete $runvlanpref->{"$num"};
+					$ready = 1;
+					last;
+				} elsif ($numvl eq 'pass') {
+					# remember to create new pass rule
+					$afterpass = 1;
+				}
+			} else {
+				# this pref is free
+				last;
+			}
+		}
+		$ready and next;
+
+		tc_add(0, $num, "vlan_id $vl action goto chain $newch");
+	}
+
+	# new vlan rules are added, add pass rule if needed
+	++$num;
+	if ($afterpass) {
+		# if we used pref number greater than old pass, add a new one
+		defined $runvlanpref->{"$num"} and die("old rules is not possible in chain 0 after pass rule: pref $num");
+		tc_add(0, $num, 'action pass');
+	} elsif (defined $runvlanpref->{"$num"}) {
+		if ($runvlanpref->{"$num"} eq 'pass') {
+			# there is already pass rule here
+			delete $runvlanpref->{"$num"};
+		} else {
+			# replace some other rule with pass rule
+			tc_replace(0, $num, 'action pass');
+			delete $runvlanpref->{"$num"};
+		}
+	} else {
+		tc_add(0, $num, 'action pass');
+	}
+
+	# delete any old rules left
+	foreach my $pref (sort { $a <=> $b } (keys %$runvlanpref)) {
+		tc_del(0, $pref);
+	}
+}
+
+# delete old chains starting from root
+foreach my $c (@{ sort_topo($runconf->{'chain'}) }) {
+	# delete only oboslete chains
+	$todelete->{$c} or next;
+
+	tc_del_chain($c);
+}
+

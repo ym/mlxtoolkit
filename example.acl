@@ -1,0 +1,36 @@
+# everything from '#' till the end of the line is a comment
+
+[chain_example_4]
+# all following rules will be appended to the chain with this name
+# chain name is a single word, number only names are not allowed
+# default final action is "drop"
+
+[vlan999] # chains names "vlan[0-9]+" are automatically attached to that vlan
+# traffic for other vlans are passed by default
+# all other chain names are supplemental
+# chain consists of filter rules, each rule is defined on a single line
+# each filter line contains action and optional filter keys
+# filter keys are:
+#   ip_proto <proto>
+#   src_ip|dst_ip <ip|net>
+#   src_port|dst_port <port>
+#   ip_ttl <ttl>
+# actions are:
+#   action pass
+#   action drop
+#   action goto [chain] # brackets are part of the syntax
+dst_ip 10.0.0.0/8 action drop
+action pass src_ip 192.168.0.1 # order of keys and action is not important
+dst_ip 172.16.0.1 action goto [chain_example_4]
+# chains that are defined later can be refered too
+ip_proto tcp dst_ip 172.16.0.2 src_port 179 action goto [vlan999_direct]
+dst_ip 172.16.0.2 action drop
+# implicit drop will be added here
+
+[vlan999_direct]
+
+action drop
+
+[chain_example_4] # if chain appears several times, rules are appended
+ip_proto icmp action pass
+
