@@ -278,6 +278,12 @@ sub run_chains_get {
 		if ($l eq '') {
 			# Commit rule
 
+			# if rule is ignored
+			if ($rule{'_ignore_'} // 0) {
+				%rule = ();
+				next;
+			}
+
 			(%rule) or die("No rule to commit");
 			$rule{'in_hw'} or die("Rule without in_hw");
 
@@ -297,13 +303,25 @@ sub run_chains_get {
 
 			%rule = ();
 			next;
+		} elsif ($rule{'_ignore_'} // 0) {
+			# do not try to parse ignored rule
+			next;
 		} elsif ($l =~ /^filter protocol .*/) {
 			# Some header
 
-			$l =~ /^filter protocol (?<proto>ip|ipv6|802\.1Q) pref (?<pref>\d+) flower chain (?<chain>\d+)(?<tail>.*)$/ or die("Can not parse line: $l");
-			my $proto = $+{'proto'};
+			# extract pref and chain first
+			$l =~ / pref (?<pref>\d+).* chain (?<chain>\d+)/ or die("Can not parse line: $l");
 			my $pref = $+{'pref'};
 			my $chain = $+{'chain'};
+
+			# check if we need to ignore the rule
+			if ($chain eq 0 and $pref < 1000) {
+				$rule{'_ignore_'} = 1;
+				next;
+			}
+
+			$l =~ /^filter protocol (?<proto>ip|ipv6|802\.1Q) pref (?<pref>\d+) flower chain (?<chain>\d+)(?<tail>.*)$/ or die("Can not parse line: $l");
+			my $proto = $+{'proto'};
 			my $tail = $+{'tail'};
 
 			(%rule) and die("Previous rule is not commited: $l");
@@ -1001,7 +1019,7 @@ foreach my $c (reverse @{ sort_topo($newchain) }) {
 # update vlans rules if needed
 # compare current vlan map with new
 if (not cmp_generic($runconf->{'vlan'}, $newconf->{'vlan'})) {
-	my $num = 0;
+	my $num = 1000 - 1;
 	my $afterpass = 0;
 	my $runvlanpref = dclone($runconf->{'vlanpref'});
 
