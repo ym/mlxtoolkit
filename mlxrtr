@@ -247,8 +247,12 @@ sub next_vlan {
 	return ($w, $s);
 }
 
-sub run_tool {
-	my ($bin, @a) = @_;
+sub run_tool_ext {
+	my %h = @_;
+	my $bin = $h{'bin'};
+	my @a = @{$h{'opt'}};
+	my $nofail = $h{'nofail'} // 0;
+	my $quieterr = $nofail;
 	my $opt = "@a";
 	my $tool = $bin;
 	$tool =~ s!.*/!!; # tool name only
@@ -257,24 +261,36 @@ sub run_tool {
 		$rocmd = 1;
 	} elsif ("$tool $opt" =~ /sysctl\s+-[benNq]*[aAX]/) {
 		$rocmd = 1;
+		$quieterr = 1;
+	}
+	if ($quieterr) {
 		$opt .= ' 2>/dev/null';
 	}
 	if ($rocmd) {
 		my @res = `$bin $opt`;
-		$? and die("run $tool failed");
+		$? and not $nofail and die("run $tool failed");
 		return @res;
 	} elsif ($_write_mode) {
 		print STDERR "$tool $opt\n";
 		my @res = `$bin $opt`;
-		$? and die("run $tool failed");
+		$? and not $nofail and die("run $tool failed");
 		return @res;
 	} else {
 		print "$bin $opt\n";
 	}
 }
 
+sub run_tool {
+	my ($bin, @a) = @_;
+	return run_tool_ext('bin' => $bin, 'opt' => \@a);
+}
+
 sub ip {
 	return run_tool('/root/bin/ip', @_);
+}
+
+sub ip_nofail {
+	return run_tool_ext('bin' => '/root/bin/ip', 'opt' => [@_], 'nofail' => 1);
 }
 
 sub bridge {
@@ -1359,12 +1375,12 @@ sub run_get_routes {
 
 	# find routes in tables
 	foreach my $t (keys %tables) {
-		foreach my $l (ip("-o -4 route show proto $route_proto table $t")) {
+		foreach my $l (ip_nofail("-o -4 route show proto $route_proto table $t")) {
 			my $r = parse_route_line('ipv4', $l);
 			route_match_dev($ifdev, @{$r->{'route'}});
 			defined $r and push @{$conf->{'route'}{$t}{'ipv4'}{$r->{'key'}}}, @{$r->{'route'}};
 		}
-		foreach my $l (ip("-o -6 route show proto $route_proto table $t")) {
+		foreach my $l (ip_nofail("-o -6 route show proto $route_proto table $t")) {
 			my $r = parse_route_line('ipv6', $l);
 			route_match_dev($ifdev, @{$r->{'route'}});
 			defined $r and push @{$conf->{'route'}{$t}{'ipv6'}{$r->{'key'}}}, @{$r->{'route'}};
