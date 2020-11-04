@@ -20,6 +20,10 @@ my $port_prefix;
 my $_curfilehandle;
 my $_curfilename;
 
+if ($ENV{'PATH'} !~ m!^/root/bin:!) {
+	$ENV{'PATH'} = '/root/bin:'.$ENV{'PATH'};
+}
+
 sub max {
 	my $m;
 	foreach (@_) {
@@ -286,19 +290,19 @@ sub run_tool {
 }
 
 sub ip {
-	return run_tool('/root/bin/ip', @_);
+	return run_tool('ip', @_);
 }
 
 sub ip_nofail {
-	return run_tool_ext('bin' => '/root/bin/ip', 'opt' => [@_], 'nofail' => 1);
+	return run_tool_ext('bin' => 'ip', 'opt' => [@_], 'nofail' => 1);
 }
 
 sub bridge {
-	return run_tool('/root/bin/bridge', @_);
+	return run_tool('bridge', @_);
 }
 
 sub tc {
-	return run_tool('/root/bin/tc', @_);
+	return run_tool('tc', @_);
 }
 
 sub devlink {

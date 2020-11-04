@@ -4,6 +4,10 @@ use Storable qw(dclone);
 
 my $_write_mode = 0;
 
+if ($ENV{'PATH'} !~ m!^/root/bin:!) {
+	$ENV{'PATH'} = '/root/bin:'.$ENV{'PATH'};
+}
+
 sub in_range {
 	my ($a, $min, $max) = @_;
 	return ($a >= $min and $a <= $max);
@@ -207,21 +211,17 @@ sub next_word {
 sub tc {
 	my $opt = "@_";
 	if ($opt =~ /^\S+\s+show(\s|$)/) {
-		my @res = `/root/bin/tc $opt`;
+		my @res = `tc $opt`;
 		$? and die('run tc failed');
 		return @res;
 	} elsif ($_write_mode) {
 		print STDERR "$opt\n";
-		my @res = `/root/bin/tc $opt`;
+		my @res = `tc $opt`;
 		$? and die('run tc failed');
 		return @res;
 	} else {
-		print "/root/bin/tc $opt\n";
+		print "tc $opt\n";
 	}
-}
-
-sub bridge {
-	return `/root/bin/bridge @_`;
 }
 
 sub tc_add {
