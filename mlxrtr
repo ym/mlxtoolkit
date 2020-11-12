@@ -1537,22 +1537,8 @@ sub run_get_vlan {
 	}
 }
 
-
-sub run_get_config {
-	my ($newtables) = @_;
-
-	my $conf = {
-		'addr' => {},
-		'bond' => {},
-		'iface' => {},
-		'route' => { map { $_ => {} } @$newtables },
-		'split' => {},
-		'switch' => {},
-		'vrf' => {},
-	};
-	defined $port_prefix or find_port_prefix();
-
-	my $iplink = {};
+sub run_get_iplink_ifaces {
+	my ($iplink) = @_;
 
 	foreach my $l (ip("-d -o link show")) {
 		my $c = {};
@@ -1598,6 +1584,10 @@ sub run_get_config {
 		
 		$iplink->{$iface} = $c;
 	}
+}
+
+sub run_get_iplink_addrs {
+	my ($iplink) = @_;
 
 	foreach my $l (ip("-o addr show")) {
 		my $c = {};
@@ -1621,6 +1611,28 @@ sub run_get_config {
 		}
 		$iplink->{$iface}{'addr'}{$f}{$ip} = 1;
 	}
+}
+
+
+sub run_get_config {
+	my ($newtables) = @_;
+
+	my $conf = {
+		'addr' => {},
+		'bond' => {},
+		'iface' => {},
+		'route' => { map { $_ => {} } @$newtables },
+		'split' => {},
+		'switch' => {},
+		'vrf' => {},
+	};
+	defined $port_prefix or find_port_prefix();
+
+	my $iplink = {};
+
+	# read link information
+	run_get_iplink_ifaces($iplink);
+	run_get_iplink_addrs($iplink);
 
 	# get port names, devlink handle and split number
 	run_port_names($conf);
