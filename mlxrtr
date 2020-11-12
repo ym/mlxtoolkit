@@ -8,6 +8,7 @@ use Storable qw(dclone);
 use File::Basename qw(dirname);
 
 my $_write_mode = 0;
+my @_show_err = ();
 
 my $max_ifname_len = 15;
 
@@ -2448,7 +2449,12 @@ sub update_config {
 	foreach my $p (sort keys %$toadd) {
 		my $dl = $runc->{'iface'}{$p}{'devlink'};
 		my $dev = $runc->{'iface'}{$p}{'name'};
-		defined $dl and defined $dev or die("resplit for $p is not supported in show mode");
+		if (not (defined $dl and defined $dev)) {
+			$_write_mode and die("oops split: missing link info for $p");
+			$dl //= '<unknown>';
+			$dev //= iface2dev($p);
+			push @_show_err, "missing link info during split $p";
+		}
 		my $n = $newc->{'split'}{$p};
 		
 		devlink("port split $dl count $n");
@@ -2755,3 +2761,7 @@ my $newconf = read_config();
 my $runconf = run_get_config([map { $newconf->{'vrf'}{$_}{'table'} } keys %{$newconf->{'vrf'}}]);
 
 update_config($runconf, $newconf);
+if (scalar @_show_err > 0) {
+	print join('', map { s/^(.*)$/# warning: $1\n/; $_; } @_show_err);
+	exit(1);
+}
