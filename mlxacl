@@ -1,5 +1,7 @@
 #!/usr/bin/perl -w
 
+my $ingress_block = 100;
+
 use Storable qw(dclone);
 
 my $_write_mode = 0;
@@ -228,12 +230,12 @@ sub tc_add {
 	my ($ch, $pref, $body) = @_;
 	$body =~ s/protocol (?<proto>\S+) //;
 	my $proto = $ch eq '0' ? '802.1q' : ($+{'proto'} // 'ip');
-	return tc("filter add block 100 protocol $proto chain $ch pref $pref flower $body");
+	return tc("filter add block $ingress_block protocol $proto chain $ch pref $pref flower $body");
 }
 
 sub tc_del {
 	my ($ch, $pref) = @_;
-	return tc("filter del block 100 chain $ch pref $pref");
+	return tc("filter del block $ingress_block chain $ch pref $pref");
 }
 
 sub tc_replace {
@@ -244,7 +246,7 @@ sub tc_replace {
 
 sub tc_del_chain {
 	my ($ch) = @_;
-	return tc("filter del block 100 chain $ch");
+	return tc("filter del block $ingress_block chain $ch");
 }
 
 sub run_ports_get {
@@ -254,7 +256,7 @@ sub run_ports_get {
 		my $qdisc = $+{'qdisc'};
 		my $p = $+{'p'};
 		$qdisc eq 'ingress' or next;
-		$l =~ / ingress_block 100 / or die("No ingress_block 100 on port $p");
+		$l =~ / ingress_block $ingress_block / or die("No ingress_block $ingress_block on port $p");
 		$ports{$p} = 1;
 	}
 	return \%ports;
@@ -273,7 +275,7 @@ sub run_chains_get {
 	my %chains = ();
 	my %rule = ();
 
-	foreach my $l (tc('filter show block 100')) {
+	foreach my $l (tc("filter show block $ingress_block")) {
 		$l =~ s/\s+$//;
 		if ($l eq '') {
 			# Commit rule
@@ -906,7 +908,7 @@ sub set_ports_qdisc {
 	my $all_ports = all_ports_get();
 
 	foreach my $p (sort keys %{ set_sub($all_ports, $cur) }) {
-		tc("qdisc add dev $p ingress_block 100 ingress");
+		tc("qdisc add dev $p ingress_block $ingress_block ingress");
 	}
 
 	# there should not be such now, but check
