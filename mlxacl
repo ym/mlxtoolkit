@@ -259,12 +259,15 @@ sub tc_del_chain {
 sub run_ports_get {
 	my %ports = ();
 	foreach my $l (tc('qdisc show')) {
-		$l =~ /^qdisc (?<qdisc>\S+) .* dev (?<p>enp\d+s\d+np\d\w*) .*/ or next;
+		$l =~ /^qdisc (?<qdisc>\S+) .* dev (?<p>\S+) / or next;
 		my $qdisc = $+{'qdisc'};
 		my $p = $+{'p'};
 		$qdisc eq 'ingress' or next;
-		$l =~ / ingress_block $ingress_block / or die("No ingress_block $ingress_block on port $p");
-		$ports{$p} = 1;
+		if ($l =~ / ingress_block (?<block>\d+) /) {
+			$ports{$p} = $+{'block'};
+		} else {
+			$ports{$p} = 'ingress';
+		}
 	}
 	return \%ports;
 }
@@ -910,15 +913,27 @@ sub dump_chains {
 }
 
 sub set_ports_qdisc {
-	my $cur = run_ports_get();
-
+	# get interfaces with ingress qdisc
+	my $ing = run_ports_get();
+	# get all switch ports
 	my $all_ports = all_ports_get();
 
+	# select only our ingress block
+	my $cur = {};
+	foreach my $p (keys %$ing) {
+		$ing->{$p} eq $ingress_block and $cur->{$p} = 1;
+	}
+
+	# add ingress qdisc and block to ports
 	foreach my $p (sort keys %{ set_sub($all_ports, $cur) }) {
+		# delete first if port has ingress qdisc, but not our block
+		if ($ing->{$p}) {
+			tc("qdisc del dev $p ingress");
+		}
 		tc("qdisc add dev $p ingress_block $ingress_block ingress");
 	}
 
-	# there should not be such now, but check
+	# there should not be outher ingresses with our block
 	foreach my $p (sort keys %{ set_sub($cur, $all_ports) }) {
 		tc("qdisc del dev $p ingress");
 	}
