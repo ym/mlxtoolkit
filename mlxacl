@@ -210,6 +210,13 @@ sub next_word {
 	return ($+{'word'}, $+{'tail'});
 }
 
+sub devlink {
+	my $opt = "@_";
+	my @res = `devlink $opt`;
+	$? and die('run devlink failed');
+	return @res;
+}
+
 sub tc {
 	my $opt = "@_";
 	if ($opt =~ /^\S+\s+show(\s|$)/) {
@@ -264,9 +271,9 @@ sub run_ports_get {
 
 sub all_ports_get {
 	my %ports = ();
-	foreach my $p (glob '/sys/class/net/enp*s*np*') {
-		$p =~ s!.*/!!;
-		$ports{$p} = 1;
+	foreach my $l (devlink('port show')) {
+		$l =~ / type eth netdev (?<name>\S+) flavour physical port / or next;
+		$ports{$+{'name'}} = 1;
         }
 	return \%ports;
 }
