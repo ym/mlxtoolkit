@@ -12,11 +12,9 @@ my @_show_err = ();
 
 my $max_ifname_len = 15;
 
-my $our_iface = qr/enp\d+s\d+np\d+\S*|bond\S+|switch|vlan\S+|vrf\S+|lo\S+/;
+my $our_iface = qr/port\S+|bond\S+|switch|vlan\S+|vrf\S+|lo\S+/;
 my @ipv6_linklocal = qw( fe80::/10 );
 my $route_proto = 'static';
-
-my $port_prefix;
 
 my $_curfilehandle;
 my $_curfilename;
@@ -36,20 +34,6 @@ sub max {
 		}
 	}
 	return $m;
-}
-
-sub find_port_prefix {
-	foreach my $p (glob '/sys/class/net/enp*s*np*') {
-		$p =~ s!.*/!!;
-		$p =~ s/np.*/np/;
-		if (defined $port_prefix) {
-			$port_prefix eq $p or die("different port prefixes found: $port_prefix, $p");
-		} else {
-			$port_prefix = $p;
-		}
-	}
-
-	defined $port_prefix or die('can not figure out port prefix');
 }
 
 sub in_range {
@@ -455,9 +439,9 @@ sub iface2dev {
 
 	if ($t eq 'port') {
 		if ($n =~ m!^(?<port>\d+)\s*/\s*(?<sub>\d+)$!) {
-			$port = $port_prefix.$+{'port'}.'s'.$+{'sub'};
+			$port = 'port'.$+{'port'}.'-'.$+{'sub'};
 		} elsif ($n =~ /^\d+$/) {
-			$port = $port_prefix.$n;
+			$port = 'port'.$n;
 		} else {
 			die("bad physical port name: $n");
 		}
@@ -1208,7 +1192,7 @@ sub read_config {
 }
 
 sub run_port_names {
-	my ($conf) = @_;
+	my ($conf, $iplink) = @_;
 
 	my %maxsplit = ();
 
@@ -1216,15 +1200,24 @@ sub run_port_names {
 	foreach my $l (devlink('port show')) {
 		$l =~ m!^(?<handle>pci[0-9:/\.]+): type (?<type>.*)$! or die("bad devlink line: $l");
 		my ($devlink, $lt) = ($+{'handle'}, $+{'type'});
-		($lt =~ /^eth netdev (?<name>enp\d+s\d+np(?<num>\d+)(s(?<sub>\d+))?)( |$)/) or next;
-		my ($name, $num, $sub) = ($+{'name'}, $+{'num'}, $+{'sub'} // '');
+		($lt =~ /^eth netdev (?<name>\S+) flavour physical port (?<num>\d+)( split_group (?<split>\d+))?( |$)/) or next;
+		my ($name, $num, $split) = ($+{'name'}, $+{'num'}, $+{'split'} // '');
 		my $p = "port $num";
 		my $base = $p;
-		if ($sub eq '') {
+		if ($split eq '') {
 			delete $conf->{'split'}{$p};
 		} else {
+			defined $iplink->{$name} or die("devlink for $name has split_group, but $name is missing in iplink");
+			defined $iplink->{$name}{'portname'} or die("missing portname for $name in iplink");
+			my $portname = $iplink->{$name}{'portname'};
+			$portname =~ /^p\d+s(?<sub>\d+)$/ or die("bad portname $portname for $name in iplink");
+			my $sub = $+{'sub'};
 			$p .= "/$sub";
 			$maxsplit{$base} = max($sub + 1, $maxsplit{$base} // 0);
+		}
+		# check if "port" name is used that it is correct
+		if ($name =~ /^port/) {
+			$name eq iface2dev($p) or die("bad port name: $name for $p");
 		}
  		$conf->{'iface'}{$p}{'devlink'} = $devlink;
 		$conf->{'iface'}{$p}{'name'} = $name;
@@ -1553,6 +1546,7 @@ sub run_get_iplink_ifaces {
 
 		$c->{'down'} = $c->{'flags'} =~ /,UP,/ ? 0 : 1;
 		$l =~ /\sportname\s+(?<val>\S+)\s/ and $c->{'portname'} = $+{'val'};
+		$l =~ /\sswitchid\s+(?<val>\S+)\s/ and $c->{'switchid'} = $+{'val'};
 		my @a = split(/\\/, $l);
 		$l = shift @a;
 		shift @a; # link/ether addr
@@ -1614,6 +1608,16 @@ sub run_get_iplink_addrs {
 	}
 }
 
+sub get_port_list {
+	my ($conf) = @_;
+	my @a = ();
+	foreach my $p (keys %{$conf->{'iface'}}) {
+		defined $conf->{'iface'}{$p}{'devlink'} or next;
+		my $name = $conf->{'iface'}{$p}{'name'};
+		push @a, $name;
+	}
+	return @a;
+}
 
 sub run_get_config {
 	my ($newtables) = @_;
@@ -1627,7 +1631,6 @@ sub run_get_config {
 		'switch' => {},
 		'vrf' => {},
 	};
-	defined $port_prefix or find_port_prefix();
 
 	my $iplink = {};
 
@@ -1636,11 +1639,15 @@ sub run_get_config {
 	run_get_iplink_addrs($iplink);
 
 	# get port names, devlink handle and split number
-	run_port_names($conf);
+	run_port_names($conf, $iplink);
 
 	# fill list with interfaces falling under our pattern
 	my @iflist = grep(/^$our_iface$/, keys %$iplink);
-	my $ifconf = { map { $_ => 1; } @iflist };
+	my @portlist = get_port_list($conf);
+	# set of all devices
+	my $ifconf = { map { $_ => 1; } (@iflist, @portlist) };
+	# update iflist with all devices (include ports)
+	@iflist = keys %$ifconf;
 	my $ifsw;
 
 	while (@iflist) {
@@ -2424,6 +2431,8 @@ sub update_config {
 		defined $dl and defined $dev or die("oops $p/0 does not exist to unsplit");
 
 		devlink("port unsplit $dl");
+		# always reread ports
+		$togetport = 1;
 
 		foreach my $iface (keys %{$runc->{'iface'}}) {
 			$iface =~ /^port / or next;
@@ -2436,28 +2445,34 @@ sub update_config {
 		delete $runc->{'split'}{$p};
 
 		# add stub for unsplit interface
-		$dev =~ s/s0$//;
 		$runc->{'iface'}{$p} //= {
-			'name' => $dev,
 			'qdisc' => { 'ingress' => 0 },
 		};
-		defined $toadd->{$p} and $togetport = 1;
+
+		# add stub device info in read-only mode
+		if (not $_write_mode) {
+			$runc->{'iface'}{$p}{'name'} = '<'.iface2dev($p).'>';
+			$runc->{'iface'}{$p}{'devlink'} = '<unknown>';
+			push @_show_err, "missing link info for $p after unsplit";
+		}
 	}
-	# reread ports if we need to resplit them
-	$togetport and run_port_names($runc);
+	# reread ports if we unsplit them
+	if ($togetport and $_write_mode) {
+		my $iplink = {};
+		run_get_iplink_ifaces($iplink);
+		run_port_names($runc, $iplink);
+	        $togetport = 0;
+	}
 	# then split
 	foreach my $p (sort keys %$toadd) {
 		my $dl = $runc->{'iface'}{$p}{'devlink'};
 		my $dev = $runc->{'iface'}{$p}{'name'};
-		if (not (defined $dl and defined $dev)) {
-			$_write_mode and die("oops split: missing link info for $p");
-			$dl //= '<unknown>';
-			$dev //= iface2dev($p);
-			push @_show_err, "missing link info during split $p";
-		}
+		(defined $dl and defined $dev) or die("oops split: missing link info for $p");
 		my $n = $newc->{'split'}{$p};
 		
 		devlink("port split $dl count $n");
+		# always reread ports
+		$togetport = 1;
 
 		# update runc with new interfaces
 
@@ -2465,11 +2480,28 @@ sub update_config {
 		iface_clear($runc, $p);
 
 		foreach my $x (0..($n - 1)) {
+			# add stub for split interface
 			$runc->{'iface'}{"$p/$x"} //= {
-				'name' => "${dev}s${x}",
 				'qdisc' => { 'ingress' => 0 },
 			};
+
+			# add stub device info in read-only mode
+			if (not $_write_mode) {
+				$runc->{'iface'}{"$p/$x"}{'name'} = '<'.iface2dev("$p/$x").'>';
+				$runc->{'iface'}{"$p/$x"}{'devlink'} = '<unknown>';
+			}
 		}
+
+		if (not $_write_mode) {
+			push @_show_err, "missing link info for $p after split";
+		}
+	}
+	# reread ports if we split them
+	if ($togetport and $_write_mode) {
+		my $iplink = {};
+		run_get_iplink_ifaces($iplink);
+		run_port_names($runc, $iplink);
+	        $togetport = 0;
 	}
 
 	# update qdisc
