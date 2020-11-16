@@ -2504,6 +2504,28 @@ sub update_config {
 	        $togetport = 0;
 	}
 
+	# update port names
+	foreach my $iface (sort keys %{$runc->{'iface'}}) {
+		$iface =~ /^port / or next;
+		my $dev = $runc->{'iface'}{$iface}{'name'};
+		my $portdev = iface2dev($iface);
+		$dev eq $portdev and next;
+		# set interface down before rename
+		my $up = 0;
+		if (not $runc->{'iface'}{$iface}{'down'}) {
+			$up = 1;
+			ip("link set dev $dev down");
+			$runc->{'iface'}{$iface}{'down'} = 1;
+		}
+		ip("link set dev $dev name $portdev");
+		$runc->{'iface'}{$iface}{'name'} = $portdev;
+		# make interface up again if we want it up
+		if ($up and not $newc->{'iface'}{$iface}{'down'}) {
+			ip("link set dev $portdev up");
+			$runc->{'iface'}{$iface}{'down'} = 0;
+		}
+	}
+
 	# update qdisc
 	foreach my $iface (sort keys %{$runc->{'iface'}}) {
 		$iface =~ /^port / or next;
