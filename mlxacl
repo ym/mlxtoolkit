@@ -275,7 +275,7 @@ sub run_ports_get {
 sub all_ports_get {
 	my %ports = ();
 	foreach my $l (devlink('port show')) {
-		$l =~ / type eth netdev (?<name>\S+) flavour physical port / or next;
+		$l =~ / type eth netdev (?<name>\S+) flavour physical( |$)/ or next;
 		$ports{$+{'name'}} = 1;
         }
 	return \%ports;

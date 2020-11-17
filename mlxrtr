@@ -1200,19 +1200,23 @@ sub run_port_names {
 	foreach my $l (devlink('port show')) {
 		$l =~ m!^(?<handle>pci[0-9:/\.]+): type (?<type>.*)$! or die("bad devlink line: $l");
 		my ($devlink, $lt) = ($+{'handle'}, $+{'type'});
-		($lt =~ /^eth netdev (?<name>\S+) flavour physical port (?<num>\d+)( split_group (?<split>\d+))?( |$)/) or next;
-		my ($name, $num, $split) = ($+{'name'}, $+{'num'}, $+{'split'} // '');
-		my $p = "port $num";
-		my $base = $p;
+		($lt =~ /^eth netdev (?<name>\S+) flavour physical( |$)/) or next;
+		my $name = $+{'name'};
+		$lt =~ / split_group (?<split>\d+)( |$)/;
+		my $split = $+{'split'} // '';
+		defined $iplink->{$name} or die("devlink for $name exists, but $name is missing in iplink");
+		defined $iplink->{$name}{'portname'} or die("missing portname for $name in iplink");
+		my $portname = $iplink->{$name}{'portname'};
+		$portname =~ /^p(?<num>\d+)(s(?<sub>\d+))?$/ or die("bad portname $portname for $name in iplink");
+		my ($num, $sub) = ($+{'num'}, $+{'sub'} // '');
+
+		my $base = "port $num";
+		my $p = $base.($sub eq '' ? '' : '/'.$sub);
 		if ($split eq '') {
+			$sub eq '' or die("oops subport $portname without split_group");
 			delete $conf->{'split'}{$p};
 		} else {
-			defined $iplink->{$name} or die("devlink for $name has split_group, but $name is missing in iplink");
-			defined $iplink->{$name}{'portname'} or die("missing portname for $name in iplink");
-			my $portname = $iplink->{$name}{'portname'};
-			$portname =~ /^p\d+s(?<sub>\d+)$/ or die("bad portname $portname for $name in iplink");
-			my $sub = $+{'sub'};
-			$p .= "/$sub";
+			$sub ne '' or die("oops port $portname with split_group");
 			$maxsplit{$base} = max($sub + 1, $maxsplit{$base} // 0);
 		}
 		# check if "port" name is used that it is correct
