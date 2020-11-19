@@ -1118,7 +1118,7 @@ sub read_config {
 		foreach my $ver (keys %$a) {
 			foreach my $ip (keys %{$a->{$ver}}) {
 				$ip =~ s!/.*$!!;
-				# skip check for ipv6 link-locak
+				# skip check for ipv6 link-local
 				$ver eq 'ipv6' and find_ip_net6($ip, @ipv6_linklocal) and next;
 				defined $tmp->{$m}{$ver}{$ip} and die("address $ip on $p in $m is already defined on some other device");
 				$tmp->{$m}{$ver}{$ip} = 1;
