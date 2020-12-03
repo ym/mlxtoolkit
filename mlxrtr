@@ -583,12 +583,20 @@ sub conf_add_iface_vlan {
 sub parse_iface_option {
 	my ($conf, $iface, $l) = @_;
 	my ($w, $s) = next_token($l);
-	$w eq 'down' or return 0;
-	($w, $s) = next_token($s);
-	$s eq '' and ($w // '') eq '' or die("bad down directive: $l");
-	defined $conf->{'iface'}{$iface}{'down'} and die("$iface is already down at: $l");
-	$conf->{'iface'}{$iface}{'down'} = 1;
-	return 1;
+	if ($w eq 'down') {
+		($w, $s) = next_token($s);
+		$s eq '' and ($w // '') eq '' or die("bad down directive: $l");
+		defined $conf->{'iface'}{$iface}{'down'} and die("$iface is already down at: $l");
+		$conf->{'iface'}{$iface}{'down'} = 1;
+		return 1;
+	} elsif ($w eq 'desc') {
+		defined $conf->{'iface'}{$iface}{'desc'} and die("$iface already has description at: $l");
+		$s =~ s/^\s+//;
+		$s ne '' and $conf->{'iface'}{$iface}{'desc'} = $s;
+		return 1;
+	} else {
+		return 0;
+	}
 }
 
 sub parse_vlan_option {
@@ -1565,13 +1573,20 @@ sub run_get_iplink_ifaces {
 		my $iface = $+{'name'};
 		defined $+{'base'} and $+{'base'} ne 'NONE' and $c->{'base'} = $+{'base'};
 		$c->{'flags'} = ','.$+{'flags'}.',';
+		$l = $+{'keys'};
 
-		$l = ' '.$+{'keys'}.' ';
+		# first check for alias at the end
+		if ($l =~ s/\s*\\\s+alias (?<val>.*)$//) {
+			$c->{'desc'} = $+{'val'};
+		}
+
+		$l = ' '.$l.' ';
 		$l =~ s/\\/ \\ /g;
 
 		$c->{'down'} = $c->{'flags'} =~ /,UP,/ ? 0 : 1;
 		$l =~ /\sportname\s+(?<val>\S+)\s/ and $c->{'portname'} = $+{'val'};
 		$l =~ /\sswitchid\s+(?<val>\S+)\s/ and $c->{'switchid'} = $+{'val'};
+
 		my @a = split(/\\/, $l);
 		$l = shift @a;
 		shift @a; # link/ether addr
@@ -1727,6 +1742,7 @@ sub run_get_config {
 		}
 
 		$conf->{'iface'}{$port}{'name'} = $name;
+		($iface->{'desc'} // '') ne '' and $conf->{'iface'}{$port}{'desc'} = $iface->{'desc'};
 		($iface->{'down'} // 0) and $conf->{'iface'}{$port}{'down'} = 1;
 		$iface->{'name'} = $port;
 		defined $iface->{'addr'} and $conf->{'addr'}{$port} = $iface->{'addr'};
@@ -2006,6 +2022,9 @@ sub dump_conf {
 			# create empty config for every port
 			# if it is down, it will be ignored later
 			$txt->{$iface} //= [];
+		}
+		if (($i->{'desc'} // '') ne '') {
+			push(@{$txt->{$iface}}, 'desc '.$i->{'desc'});
 		}
 		if ($i->{'down'} // 0) {
 			push(@{$txt->{$iface}}, 'down');
@@ -2704,6 +2723,16 @@ sub update_config {
 		}
 	}
 	
+	# update descriptions (aliases)
+	# all interfaces should be created now
+	foreach my $iface (sort keys %{$runc->{'iface'}}) {
+		$a = $runc->{'iface'}{$iface}{'desc'} // '';
+		$b = $newc->{'iface'}{$iface}{'desc'} // '';
+		$a eq $b and next;
+		my $dev = conf_ifdev($runc, $iface);
+		ip(qw'link set dev', $dev, 'alias', $b);
+	}
+
 	# link up/down
 	$a = [grep {
 		($runc->{'iface'}{$_}{'down'} //= 0) == 1
