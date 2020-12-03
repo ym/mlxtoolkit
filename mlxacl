@@ -210,15 +210,36 @@ sub next_word {
 	return ($+{'word'}, $+{'tail'});
 }
 
+sub shell_quote {
+	my ($s) = @_;
+	$s =~ m!^[-_.,/%:a-zA-Z0-9]+$! and return $s;
+	$s =~ /'/ or return "'$s'";
+	if ($s =~ /!/) {
+		my @a = ();
+		foreach my $p (split(/!/, $s, -1)) {
+			push(@a, $p eq '' ? '' : shell_quote($p));
+		}
+		return join('\!', @a);
+	} else {
+		$s =~ s/(["\\\$`])/\\$1/g;
+		return "\"$s\"";
+	}
+}
+
+sub mapf {
+	my ($f, @a) = @_;
+	return map { $_ = &$f($_) } @a;
+}
+
 sub devlink {
-	my $opt = "@_";
+	my $opt = join(' ', mapf(\&shell_quote, @_));
 	my @res = `devlink $opt`;
 	$? and die('run devlink failed');
 	return @res;
 }
 
 sub tc {
-	my $opt = "@_";
+	my $opt = join(' ', mapf(\&shell_quote, @_));
 	if ($opt =~ /^\S+\s+show(\s|$)/) {
 		my @res = `tc $opt`;
 		$? and die('run tc failed');
@@ -234,31 +255,46 @@ sub tc {
 }
 
 sub tc_add {
-	my ($ch, $pref, $body) = @_;
-	$body =~ s/protocol (?<proto>\S+) //;
-	my $proto = $ch eq '0' ? '802.1q' : ($+{'proto'} // 'ip');
-	return tc("filter add block $ingress_block protocol $proto chain $ch pref $pref flower $body");
+	my ($ch, $pref, @body) = @_;
+	my @a = ();
+	my $proto_next = 0;
+	my $proto;
+	# grep and cut protocol from array
+	foreach my $s (@body) {
+		if ($proto_next) {
+			$proto = $s;
+			$proto_next = 0;
+			next;
+		} elsif ($s eq 'protocol') {
+			$proto_next = 1;
+			next
+		} else {
+			push(@a, $s);
+		}
+	}
+	$proto = $ch eq '0' ? '802.1q' : ($proto // 'ip');
+	return tc(qw'filter add block', $ingress_block, 'protocol', $proto, 'chain', $ch, 'pref', $pref, 'flower', @a);
 }
 
 sub tc_del {
 	my ($ch, $pref) = @_;
-	return tc("filter del block $ingress_block chain $ch pref $pref");
+	return tc(qw'filter del block', $ingress_block, 'chain', $ch, 'pref', $pref);
 }
 
 sub tc_replace {
-	my ($ch, $pref, $body) = @_;
+	my ($ch, $pref, @body) = @_;
 	tc_del($ch, $pref);
-	tc_add($ch, $pref, $body);
+	tc_add($ch, $pref, @body);
 }
 
 sub tc_del_chain {
 	my ($ch) = @_;
-	return tc("filter del block $ingress_block chain $ch");
+	return tc(qw'filter del block', $ingress_block, 'chain', $ch);
 }
 
 sub run_ports_get {
 	my %ports = ();
-	foreach my $l (tc('qdisc show')) {
+	foreach my $l (tc(qw'qdisc show')) {
 		$l =~ /^qdisc (?<qdisc>\S+) .* dev (?<p>\S+) / or next;
 		my $qdisc = $+{'qdisc'};
 		my $p = $+{'p'};
@@ -274,7 +310,7 @@ sub run_ports_get {
 
 sub all_ports_get {
 	my %ports = ();
-	foreach my $l (devlink('port show')) {
+	foreach my $l (devlink(qw'port show')) {
 		$l =~ / type eth netdev (?<name>\S+) flavour physical( |$)/ or next;
 		$ports{$+{'name'}} = 1;
         }
@@ -285,7 +321,7 @@ sub run_chains_get {
 	my %chains = ();
 	my %rule = ();
 
-	foreach my $l (tc("filter show block $ingress_block")) {
+	foreach my $l (tc(qw'filter show block', $ingress_block)) {
 		$l =~ s/\s+$//;
 		if ($l eq '') {
 			# Commit rule
@@ -928,14 +964,14 @@ sub set_ports_qdisc {
 	foreach my $p (sort keys %{ set_sub($all_ports, $cur) }) {
 		# delete first if port has ingress qdisc, but not our block
 		if ($ing->{$p}) {
-			tc("qdisc del dev $p ingress");
+			tc(qw'qdisc del dev', $p, 'ingress');
 		}
-		tc("qdisc add dev $p ingress_block $ingress_block ingress");
+		tc(qw'qdisc add dev', $p, 'ingress_block', $ingress_block, 'ingress');
 	}
 
 	# there should not be outher ingresses with our block
 	foreach my $p (sort keys %{ set_sub($cur, $all_ports) }) {
-		tc("qdisc del dev $p ingress");
+		tc(qw'qdisc del dev', $p, 'ingress');
 	}
 }
 
@@ -1027,16 +1063,16 @@ foreach my $c (reverse @{ sort_topo($newchain) }) {
 	my $pref = 0;
 	foreach my $r (@$rule) {
 		++$pref;
-		my $s = 'protocol '.$r->{'proto'};
+		my @s = ('protocol', $r->{'proto'});
 		foreach my $k (sort { $keyprio{$a} <=> $keyprio{$b} } keys %{$r->{'keys'}}) {
-			$s .= " $k ".$r->{'keys'}{$k};
+			push(@s, $k, $r->{'keys'}{$k});
 		}
 		if ($r->{'action'} =~ /^goto (?<goto>.*)$/) {
-			$s .= " action goto chain ".$+{'goto'};
+			push(@s, qw'action goto chain', $+{'goto'});
 		} else {
-			$s .= " action ".$r->{'action'};
+			push(@s, 'action', $r->{'action'});
 		}
-		tc_add($c, $pref, $s);
+		tc_add($c, $pref, @s);
 	}
 }
 
@@ -1072,7 +1108,7 @@ if (not cmp_generic($runconf->{'vlan'}, $newconf->{'vlan'})) {
 		}
 		$ready and next;
 
-		tc_add(0, $num, "vlan_id $vl action goto chain $newch");
+		tc_add(0, $num, 'vlan_id', $vl, qw'action goto chain', $newch);
 	}
 
 	# new vlan rules are added, add pass rule if needed
@@ -1080,18 +1116,18 @@ if (not cmp_generic($runconf->{'vlan'}, $newconf->{'vlan'})) {
 	if ($afterpass) {
 		# if we used pref number greater than old pass, add a new one
 		defined $runvlanpref->{"$num"} and die("old rules is not possible in chain 0 after pass rule: pref $num");
-		tc_add(0, $num, 'action pass');
+		tc_add(0, $num, qw'action pass');
 	} elsif (defined $runvlanpref->{"$num"}) {
 		if ($runvlanpref->{"$num"} eq 'pass') {
 			# there is already pass rule here
 			delete $runvlanpref->{"$num"};
 		} else {
 			# replace some other rule with pass rule
-			tc_replace(0, $num, 'action pass');
+			tc_replace(0, $num, qw'action pass');
 			delete $runvlanpref->{"$num"};
 		}
 	} else {
-		tc_add(0, $num, 'action pass');
+		tc_add(0, $num, qw'action pass');
 	}
 
 	# delete any old rules left
