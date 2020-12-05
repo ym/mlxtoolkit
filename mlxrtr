@@ -2256,16 +2256,16 @@ sub ip_ver_opt {
 sub pfxkey2opt {
 	my ($key, $full) = @_;
 	$key =~ /^(?<pfx>\S+) (?<metric>\S+) (?<tos>\S+)$/ or die("oops pfx key: $key");
-	my $s = sprintf("%s metric %s", $+{'pfx'}, $+{'metric'});
-	($+{'tos'} != 0 or ($full // 0)) and $s .= sprintf(" tos 0x%x", $+{'tos'});
-	return $s;
+	my @s = ($+{'pfx'}, 'metric', $+{'metric'});
+	($+{'tos'} != 0 or ($full // 0)) and push(@s, 'tos', sprintf('0x%x', $+{'tos'}));
+	return @s;
 }
 
 sub route_add {
 	my ($conf, $t, $f, $pfx, $nh) = @_;
 	my $opt = ip_ver_opt($f);
-	$pfx = pfxkey2opt($pfx);
-	my @node_spec = ($pfx, 'table', $t, 'proto', $route_proto);
+	my @pfxext = pfxkey2opt($pfx);
+	my @node_spec = (@pfxext, 'table', $t, 'proto', $route_proto);
 	my @info_spec = ();
 	foreach my $h (@$nh) {
 		my @l = ();
@@ -2817,8 +2817,8 @@ sub update_config {
 			($todel, $toadd) = hash_diff($a, $b);
 			# delete routes
 			foreach my $pfx (sort keys %$todel) {
-				$pfx = pfxkey2opt($pfx, 1);
-				ip($opt, qw'route flush exact', $pfx, 'table', $t, 'proto', $route_proto);
+				my @pfxext = pfxkey2opt($pfx, 1);
+				ip($opt, qw'route flush exact', @pfxext, 'table', $t, 'proto', $route_proto);
 				delete $a->{$pfx};
 			}
 			# add routes
