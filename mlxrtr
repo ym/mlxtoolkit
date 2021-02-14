@@ -1310,7 +1310,7 @@ sub parse_route_line {
 			$nh->{'weight'} = int($t);
 			$wasnh = 1;
 			next;
-		} elsif ($t =~ /^(dead|linkdown|offload)$/) {
+		} elsif ($t =~ /^(dead|linkdown|offload|rt_offload|rt_trap)$/) {
 			# do not set $wasnh
 			# some attrs can be shown for the whole route
 			#$wasnh = 1;
