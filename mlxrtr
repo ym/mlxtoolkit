@@ -319,6 +319,15 @@ sub sysctl {
 	return run_tool('sysctl', @_);
 }
 
+sub read_file {
+	my ($f) = @_;
+	open(TMP, '<', $f) or return '';
+	my $s = join("\n", <TMP>);
+	close(TMP);
+	chomp $s;
+	return $s;
+}
+
 sub cmp_generic {
 	my ($a, $b) = @_;
 	my $ra = ref($a);
@@ -1269,6 +1278,18 @@ sub run_port_names {
 	}
 }
 
+# find mac addresses in iplink for ifaces in conf
+sub run_macs {
+	my ($conf, $iplink) = @_;
+
+	foreach my $iface (sort keys %{$conf->{'iface'}}) {
+		my $dev = conf_ifdev($conf, $iface);
+		defined $iplink->{$dev}{'mac'} or next;
+		$conf->{'iface'}{$iface}{'mac'} = $iplink->{$dev}{'mac'};
+		$conf->{'iface'}{$iface}{'addr_assign_type'} = $iplink->{$dev}{'addr_assign_type'};
+	}
+}
+
 sub parse_route_line {
 	my ($ver, $l) = @_;
 
@@ -1596,11 +1617,12 @@ sub run_get_iplink_ifaces {
 		$l =~ /\sswitchid\s+(?<val>\S+)\s/ and $c->{'switchid'} = $+{'val'};
 
 		my @a = split(/\\/, $l);
-		$l = shift @a;
-		shift @a; # link/ether addr
+		$l = shift @a; # first line
 		$l =~ /\smaster\s+(?<val>\S+)\s/ and $c->{'master'} = $+{'val'};
 		$l =~ /\sqdisc\s+(?<val>\S+)\s/ and $c->{'qdisc'} = $+{'val'};
 		$l =~ /\smtu\s+(?<val>\S+)\s/ and $c->{'mtu'} = $+{'val'};
+		$l = shift @a; # link/ether addr
+		$l =~ /\slink\/ether\s+(?<mac>\S+)\s/ and $c->{'mac'} = $+{'mac'};
 		foreach my $l (@a) {
 			my $t = '';
 			$l =~ /^\s*(?<val>\S+)\s/ and $t = $+{'val'};
@@ -1624,6 +1646,8 @@ sub run_get_iplink_ifaces {
 				$l =~ /\sid\s+(?<val>\S+)\s/ and $c->{'vlan_id'} = $+{'val'};
 			}
 		}
+
+		defined $c->{'mac'} and $c->{'addr_assign_type'} = read_file("/sys/class/net/$iface/addr_assign_type");
 		
 		$iplink->{$iface} = $c;
 	}
@@ -1778,6 +1802,9 @@ sub run_get_config {
 	# setting default name is not required
 	# but causes interface to seem present
 	#$conf->{'iface'}{'switch'}{'name'} //= 'switch';
+
+	# get mac addresses
+	run_macs($conf, $iplink);
 
 	# fill interface masters
 	foreach my $dev (keys %$ifconf) {
@@ -2007,9 +2034,15 @@ sub dump_conf {
 		push(@{$txt->{'global'}}, "# ip6 rules is not altered");
 	}
 	# iface
-	foreach my $iface (keys %{$conf->{'iface'}}) {
+	foreach my $iface (sort keys %{$conf->{'iface'}}) {
 		my $i = $conf->{'iface'}{$iface};
 		my $d = iface2dev($iface);
+
+		if ($iface =~ /^(bond |vlan |switch)/ and ($i->{'addr_assign_type'} // '0') ne '3') {
+			$bad = 1;
+			push(@{$txt->{$iface}}, '# mac is not persistent');
+		}
+
 		if ($iface eq 'switch') {
 			if (defined $i->{'name'} and $i->{'name'} ne $d) {
 				$bad = 1;
@@ -2513,6 +2546,7 @@ sub update_config {
 		my $iplink = {};
 		run_get_iplink_ifaces($iplink);
 		run_port_names($runc, $iplink);
+		run_macs($runc, $iplink);
 	        $togetport = 0;
 	}
 	# then split
@@ -2553,6 +2587,7 @@ sub update_config {
 		my $iplink = {};
 		run_get_iplink_ifaces($iplink);
 		run_port_names($runc, $iplink);
+		run_macs($runc, $iplink);
 	        $togetport = 0;
 	}
 
@@ -2607,6 +2642,7 @@ sub update_config {
 				push(@opt, $k, $b->{$k});
 			}
 			ip(qw'link add name', $dev, qw'type bond', @opt);
+			$togetport = 1;
 			$runc->{'bond'}{$iface} = dclone($b);
 		} elsif ($iface =~ /^vrf /) {
 			# add vrf interfaces
@@ -2619,6 +2655,7 @@ sub update_config {
 		} elsif ($iface eq 'switch') {
 			# add switch interface
 			ip(qw'link add name', $dev, qw'type bridge vlan_filtering 1');
+			$togetport = 1;
 			# default config after creation
 			$runc->{'switch'}{'switch'} = {
 				'native' => { 1 => 1 },
@@ -2657,6 +2694,7 @@ sub update_config {
 			my $vid = $+{'vid'};
 			my $sw = conf_ifdev($runc, 'switch');
 			ip(qw'link add link', $sw, 'name', $dev, qw'type vlan id', $vid);
+			$togetport = 1;
 			ip(qw'link set dev', $dev, 'down');
 			$runc->{'iface'}{$iface} = {
 				'name' => $dev,
@@ -2675,6 +2713,28 @@ sub update_config {
 	foreach my $m (sortiface keys %$toadd) {
 		$m =~ /^(?<iface>.*)!(?<master>.*)$/ or die("oops map master: $m");
 		iface_set_master($runc, $+{'iface'}, $+{'master'});
+	}
+
+	# reread macs if we created new interfaces
+	if ($togetport and $_write_mode) {
+		my $iplink = {};
+		run_get_iplink_ifaces($iplink);
+		run_macs($runc, $iplink);
+		$togetport = 0;
+	}
+
+	# set persistent mac for some interface types
+	foreach my $iface (sort keys %{$runc->{'iface'}}) {
+		$iface =~ /^(bond |vlan |switch)/ or next;
+		my $dev = conf_ifdev($runc, $iface);
+		if (($runc->{'iface'}{$iface}{'addr_assign_type'} // '0') ne '3') {
+			$runc->{'iface'}{$iface}{'mac'} //= '<unknown>';
+			if (not $_write_mode and $runc->{'iface'}{$iface}{'mac'} eq '<unknown>') {
+				push @_show_err, "missing mac info for new iface $iface";
+			}
+			ip(qw'link set dev', $dev, 'address', $runc->{'iface'}{$iface}{'mac'});
+			$runc->{'iface'}{$iface}{'addr_assign_type'} = '3';
+		}
 	}
 
 	# configure bridge
