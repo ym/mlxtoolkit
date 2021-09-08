@@ -558,6 +558,11 @@ sub parse_global_section {
 	}
 }
 
+sub parse_switch_section {
+	my ($conf, $iface, $l) = @_;
+	return 0;
+}
+
 sub conf_set_iface_master {
 	my ($conf, $iface, $master) = @_;
 	$conf->{'iface'}{$iface}{'master'} //= $master;
@@ -907,6 +912,7 @@ my $section_parser = {
 	'bond' => \&parse_bond_section,
 	'loopback' => \&parse_loopback_section,
 	'port' => \&parse_port_section,
+	'switch' => \&parse_switch_section,
 	'vlan' => \&parse_vlan_section,
 	'vrf' => \&parse_vrf_section,
 };
@@ -914,6 +920,8 @@ my $section_parser = {
 sub parse_section {
 	my ($conf, $s) = @_;
 	if ($s eq 'global') {
+		return ($s, $s);
+	} elsif ($s eq 'switch') {
 		return ($s, $s);
 	} else {
 		my ($port, $type);
@@ -2005,11 +2013,11 @@ sub dump_conf {
 		if ($iface eq 'switch') {
 			if (defined $i->{'name'} and $i->{'name'} ne $d) {
 				$bad = 1;
-				push(@{$txt->{'global'}}, "# switch dev: ".$i->{'name'});
+				push(@{$txt->{'switch'}}, "# dev: ".$i->{'name'});
 			}
 			if ($i->{'down'} // 0) {
 				$bad = 1;
-				push(@{$txt->{'global'}}, "# switch dev is down");
+				push(@{$txt->{'switch'}}, "# dev is down");
 			}
 			next;
 		}
@@ -2073,11 +2081,11 @@ sub dump_conf {
 		if ($iface eq 'switch') {
 			if (not defined $v->{'native'}{'1'}) {
 				$bad = 1;
-				push(@{$txt->{'global'}}, "# no native 1 on switch");
+				push(@{$txt->{'switch'}}, "# no native 1");
 			}
 			if ((keys %{$v->{'native'} // {}}) > 1) {
 				$bad = 1;
-				push(@{$txt->{'global'}}, "# broken native on switch");
+				push(@{$txt->{'switch'}}, "# broken native");
 			}
 			next;
 		}
