@@ -3,6 +3,7 @@
 my $ingress_block = 100;
 
 use Storable qw(dclone);
+use JSON::PP;
 
 my $_write_mode = 0;
 
@@ -235,20 +236,20 @@ sub devlink {
 	my $opt = join(' ', mapf(\&shell_quote, @_));
 	my @res = `devlink $opt`;
 	$? and die('run devlink failed');
-	return @res;
+	return join('', @res);
 }
 
 sub tc {
 	my $opt = join(' ', mapf(\&shell_quote, @_));
-	if ($opt =~ /^\S+\s+show(\s|$)/) {
+	if ($opt =~ /^(-j\s+)?\S+\s+show(\s|$)/) {
 		my @res = `tc $opt`;
 		$? and die('run tc failed');
-		return @res;
+		return join('', @res);
 	} elsif ($_write_mode) {
 		print STDERR "$opt\n";
 		my @res = `tc $opt`;
 		$? and die('run tc failed');
-		return @res;
+		return join('', @res);
 	} else {
 		print "tc $opt\n";
 	}
@@ -294,107 +295,69 @@ sub tc_del_chain {
 
 sub run_ports_get {
 	my %ports = ();
-	foreach my $l (tc(qw'qdisc show')) {
-		$l =~ /^qdisc (?<qdisc>\S+) .* dev (?<p>\S+) / or next;
-		my $qdisc = $+{'qdisc'};
-		my $p = $+{'p'};
+	my $j = decode_json tc(qw'-j qdisc show');
+	foreach my $l (@$j) {
+		my $qdisc = $l->{'kind'} // '';
+		my $p = $l->{'dev'} // '';
 		$qdisc eq 'ingress' or next;
-		if ($l =~ / ingress_block (?<block>\d+) /) {
-			$ports{$p} = $+{'block'};
-		} else {
-			$ports{$p} = 'ingress';
-		}
+		$ports{$p} = $l->{'ingress_block'} // 'ingress';
 	}
 	return \%ports;
 }
 
 sub all_ports_get {
 	my %ports = ();
-	foreach my $l (devlink(qw'port show')) {
-		$l =~ / type eth netdev (?<name>\S+) flavour physical( |$)/ or next;
-		$ports{$+{'name'}} = 1;
+	my $j = decode_json devlink(qw'-j port show');
+	foreach my $pci (keys %{$j->{'port'}}) {
+		my $l = $j->{'port'}{$pci};
+		$l->{'type'} eq 'eth' and $l->{'flavour'} eq 'physical' or next;
+		$ports{$l->{'netdev'}} = 1;
         }
 	return \%ports;
 }
 
 sub run_chains_get {
 	my %chains = ();
-	my %rule = ();
 
-	foreach my $l (tc(qw'filter show block', $ingress_block)) {
-		$l =~ s/\s+$//;
-		if ($l eq '') {
-			# Commit rule
+	my $j = decode_json tc(qw'-j filter show block', $ingress_block);
+	foreach my $l (@$j) {
+		my %rule = ();
 
-			# if rule is ignored
-			if ($rule{'_ignore_'} // 0) {
-				%rule = ();
-				next;
-			}
+		# extract pref and chain first
+		my $pref = $l->{'pref'};
+		my $chain = $l->{'chain'};
 
-			(%rule) or die("No rule to commit");
-			$rule{'in_hw'} or die("Rule without in_hw");
-
-			if (($chains{$rule{'chain'}}{'ruleid'}{$rule{'pref'}}{'handle'} // '') ne '') {
-				$chains{$rule{'chain'}}{'ruleid'}{$rule{'pref'}} = {
-					'proto' => $rule{'proto'},
-					'handle' => 'multiple',
-				};
-			} else {
-				$chains{$rule{'chain'}}{'ruleid'}{$rule{'pref'}} = {
-					'proto' => $rule{'proto'},
-					'handle' => $rule{'handle'},
-					'keys' => $rule{'keys'} // {},
-					'action' => $rule{'action'},
-				};
-			}
-
-			%rule = ();
+		# check if we need to ignore the rule
+		if ($chain eq 0 and $pref < 1000) {
 			next;
-		} elsif ($rule{'_ignore_'} // 0) {
-			# do not try to parse ignored rule
+		}
+
+		my $proto = $l->{'protocol'};
+
+		($proto eq '802.1Q' and $chain eq 0) or ($proto =~ /^ip(v6)?$/ and $chain > 0) or die("Unsupported proto and chain combination: chain '$chain' proto '$proto'");
+
+		if (not defined $l->{'options'}) {
+			# Rule header
+			$chains{$chain}{'ruleid'}{$pref} = { 'proto' => $proto };
 			next;
-		} elsif ($l =~ /^filter protocol .*/) {
-			# Some header
+		}
 
-			# extract pref and chain first
-			$l =~ / pref (?<pref>\d+).* chain (?<chain>\d+)/ or die("Can not parse line: $l");
-			my $pref = $+{'pref'};
-			my $chain = $+{'chain'};
+		# Rule handle
 
-			# check if we need to ignore the rule
-			if ($chain eq 0 and $pref < 1000) {
-				$rule{'_ignore_'} = 1;
-				next;
-			}
+		(($chains{$chain}{'ruleid'}{$pref}{'proto'} // '') ne $proto) and die("Rule handle does not match header: ".encode_json($l));
+		my $o = $l->{'options'};
+		my $handle = $o->{'handle'};
+		%rule = (
+			'chain' => $chain,
+			'pref' => $pref,
+			'proto' => $proto,
+			'handle' => $handle,
+		);
 
-			$l =~ /^filter protocol (?<proto>ip|ipv6|802\.1Q) pref (?<pref>\d+) flower chain (?<chain>\d+)(?<tail>.*)$/ or die("Can not parse line: $l");
-			my $proto = $+{'proto'};
-			my $tail = $+{'tail'};
+		# Filter keys
 
-			(%rule) and die("Previous rule is not commited: $l");
-			($proto eq '802.1Q' and $chain eq 0) or ($proto =~ /^ip(v6)?$/ and $chain > 0) or die("Unsupported proto and chain combination: chain '$chain' proto '$proto'");
-
-			if ($tail eq '') {
-				# Rule header
-				$chains{$chain}{'ruleid'}{$pref} = { 'proto' => $proto };
-				next;
-			} else {
-				# Rule handle
-				(($chains{$chain}{'ruleid'}{$pref}{'proto'} // '') ne $proto) and die("Rule handle does not match header: $l");
-				$tail =~ /^ handle (?<handle>\S+)$/ or die("Bad rule handle: $l");
-				my $handle = $+{'handle'};
-				%rule = (
-					'chain' => $chain,
-					'pref' => $pref,
-					'proto' => $proto,
-					'handle' => $handle,
-				);
-				next;
-			}
-		} elsif ($l =~ /^  (?<key>\S+)( (?<param>.*))?$/) {
-			# Filter expression
-			my ($key, $param) = ($+{'key'}, $+{'param'});
+		foreach my $key (keys %{$o->{'keys'}}) {
+			my $param = $o->{'keys'}{$key};
 
 			if (defined $filter_keys{$key}) {
 				$rule{'proto'} =~ /^ip(v6)?$/ or die("Bad protocol '${rule{'proto'}}' for key '$key'");
@@ -402,9 +365,6 @@ sub run_chains_get {
 				$rule{'keys'}{$key} = $p;
 				next;
 			} elsif ($key =~ /^eth_type$/) {
-				next;
-			} elsif ($key =~ /^in_hw|skip_sw$/) {
-				$rule{$key} = 1;
 				next;
 			} elsif ($key eq 'vlan_id') {
 				$rule{'proto'} eq '802.1Q' or die("Bad protocol '${rule{'proto'}}' for key '$key'");
@@ -414,34 +374,50 @@ sub run_chains_get {
 			} else {
 				die("Unsupported filter key '$key'");
 			}
-		} elsif ($l =~ /^\taction (.*)$/) {
-			# Action
-			$1 =~ /^order 1: gact action (?<act>.*)$/ or die("Unsupported action line: $l");
-			my $act = $+{'act'};
+		}
+
+		# Filter actions
+
+		foreach my $a (@{$o->{'actions'}}) {
+			$a->{'order'} eq '1' and $a->{'kind'} eq 'gact' or die("Unsupported action line: ".encode_json($l));
+			my $act = $a->{'control_action'}{'type'};
 			if ($act =~ /^(drop|pass)$/) {
 				$rule{'action'} = $act;
 				next;
-			} elsif ($act =~ /^goto chain (\d+)$/) {
-				my $goto = $1;
+			} elsif ($act eq 'goto') {
+				my $goto = $a->{'control_action'}{'chain'};
 				# internal representation without "chain" word
-				$rule{'action'} = "goto $1";
+				$rule{'action'} = "goto $goto";
 				$chains{$rule{'chain'}}{'refers'}{$goto} = 1;
 				$chains{$goto}{'referedby'}{$rule{'chain'}} = 1;
 				next;
 			} else {
-				die("Unsupported action: $l");
+				die("Unsupported action: ".encode_json($l));
 			}
-		} elsif ($l =~ /^\t .*$/) {
-			# Other attributes
-			next;
-		} elsif ($l =~ /^\tused_hw_stats /) {
-			# Skip this directive
-			next;
+		}
+
+		$rule{'in_hw'} = $o->{'in_hw'} // 0;
+		$rule{'skip_sw'} = $o->{'skip_sw'} // 0;
+
+		# Remember rule
+
+		(%rule) or die("No rule to commit");
+		$rule{'in_hw'} or die("Rule without in_hw");
+
+		if (($chains{$rule{'chain'}}{'ruleid'}{$rule{'pref'}}{'handle'} // '') ne '') {
+			$chains{$rule{'chain'}}{'ruleid'}{$rule{'pref'}} = {
+				'proto' => $rule{'proto'},
+				'handle' => 'multiple',
+			};
 		} else {
-			die("Unsupported line: $l");
+			$chains{$rule{'chain'}}{'ruleid'}{$rule{'pref'}} = {
+				'proto' => $rule{'proto'},
+				'handle' => $rule{'handle'},
+				'keys' => $rule{'keys'} // {},
+				'action' => $rule{'action'},
+			};
 		}
 	}
-	(%rule) and die("Rule has not been commited");
 
 	return \%chains;
 }

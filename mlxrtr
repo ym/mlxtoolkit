@@ -1,11 +1,14 @@
 #!/usr/bin/perl
 
+my $ingress_block = 100;
+
 use warnings;
 use strict;
 no autovivification;
 
 use Storable qw(dclone);
 use File::Basename qw(dirname);
+use JSON::PP;
 
 my $_write_mode = 0;
 my @_show_err = ();
@@ -278,13 +281,19 @@ sub run_tool_ext {
 	}
 	if ($rocmd) {
 		my @res = `$bin $opt`;
-		$? and not $nofail and die("run $tool failed");
-		return @res;
+		if ($?) {
+			not $nofail and die("run $tool failed");
+			return undef;
+		}
+		return join('', @res);
 	} elsif ($_write_mode) {
 		print STDERR "$tool $opt\n";
 		my @res = `$bin $opt`;
-		$? and not $nofail and die("run $tool failed");
-		return @res;
+		if ($?) {
+			not $nofail and die("run $tool failed");
+			return undef;
+		}
+		return join('', @res);
 	} else {
 		print "$bin $opt\n";
 	}
@@ -1243,13 +1252,13 @@ sub run_port_names {
 	my %maxsplit = ();
 
 	# find interface names and split
-	foreach my $l (devlink(qw'port show')) {
-		$l =~ m!^(?<handle>pci[0-9:/\.]+): type (?<type>.*)$! or die("bad devlink line: $l");
-		my ($devlink, $lt) = ($+{'handle'}, $+{'type'});
-		($lt =~ /^eth netdev (?<name>\S+) flavour physical( |$)/) or next;
-		my $name = $+{'name'};
-		$lt =~ / split_group (?<split>\d+)( |$)/;
-		my $split = $+{'split'} // '';
+	my $j = decode_json devlink(qw'-j port show');
+	foreach my $devlink (keys %{$j->{'port'}}) {
+		my $l = $j->{'port'}{$devlink};
+		my $lt = $l->{'type'};
+		$lt eq 'eth' and $l->{'flavour'} eq 'physical' or next;
+		my $name = $l->{'netdev'};
+		my $split = $l->{'split_group'} // '';
 		defined $iplink->{$name} or die("devlink for $name exists, but $name is missing in iplink");
 		defined $iplink->{$name}{'portname'} or die("missing portname for $name in iplink");
 		my $portname = $iplink->{$name}{'portname'};
@@ -1291,96 +1300,84 @@ sub run_macs {
 }
 
 sub parse_route_line {
-	my ($ver, $l) = @_;
+	my ($ver, $j) = @_;
 
 	my $ipfun;
 	if ($ver eq 'ipv4') { $ipfun = \&parse_prefix4; }
 	elsif ($ver eq 'ipv6') { $ipfun = \&parse_prefix6; }
 	else { die("bad ip version: $ver"); }
 
+	my $l = encode_json($j);
 	my $r = {};
-	my $t;
-	my $s = $l;
-	$s =~ s/\\/ /g;
-	($t, $s) = next_word($s);
+	my $t = '';
 
-	defined $t or die("bad route line: $l");
-	if ($t ne 'default' and ip_ver($t) eq '') {
-		$r->{'type'} = $t;
-		($t, $s) = next_word($s);
-	}
-	defined $t or die("bad route line: $l");
-	$t = &$ipfun($t);
+	$r->{'type'} = $j->{'type'} // 'unicast';
+	delete $j->{'type'};
+
+	$t = &$ipfun($j->{'dst'});
 	defined $t or die("bad prefix in route: $l");
 	$r->{'prefix'} = $t;
+	delete $j->{'dst'};
 
-	my $nh = {};
-	my $wasnh = 0;
+	if (not defined $j->{'nexthops'}) {
+		my $nh = {};
+		for my $a (qw/dev flags gateway/) {
+			defined $j->{$a} or next;
+			$nh->{$a} = $j->{$a};
+			delete $j->{$a};
+		}
+		$j->{'nexthops'} = [$nh];
+	}
 
-	while ($s !~ /^\s*$/) {
-		($t, $s) = next_word($s);
+	foreach my $e (@{$j->{'nexthops'}}) {
+		my $nh = {};
 
-		if ($t eq 'via') {
-			($t, $s) = next_word($s);
-			my $via = &$ipfun($t // '', 0);
+		if (defined $e->{'gateway'}) {
+			my $via = &$ipfun($e->{'gateway'}, 0);
 			defined $via or die("bad via address in route line: $l");
 			$nh->{'via'} = $via;
-			$wasnh = 1;
-			next;
-		} elsif ($t eq 'dev') {
-			($t, $s) = next_word($s);
-			defined $t or die("no device name in route line: $l");
-			$nh->{'dev'} = $t;
-			$wasnh = 1;
-			next;
-		} elsif ($t eq 'weight') {
-			($t, $s) = next_word($s);
-			($t // '') =~ /^\d+$/ or die("bad weight in route line: $l");
-			$nh->{'weight'} = int($t);
-			$wasnh = 1;
-			next;
-		} elsif ($t =~ /^(dead|linkdown|offload|rt_offload|rt_trap)$/) {
-			# do not set $wasnh
-			# some attrs can be shown for the whole route
-			#$wasnh = 1;
-			next;
+			delete $e->{'gateway'};
 		}
 
-		if ($wasnh) {
-			push @{$r->{'nexthop'}}, $nh;
-			$nh = {};
-			$wasnh = 0;
+		if (defined $e->{'dev'}) {
+			$nh->{'dev'} = $e->{'dev'};
+			delete $e->{'dev'};
 		}
 
-		if ($t eq 'nexthop') {
-			# do nothing
-		} elsif ($t eq 'tos') {
-			($t, $s) = next_word($s);
-			($t // '') =~ /^0x[0-9a-fA-F]+$/ or die("bad tos value in route line: $l");
-			$r->{'tos'} = hex($t);
-		} elsif ($t eq 'metric') {
-			($t, $s) = next_word($s);
-			($t // '') =~ /^\d+$/ or die("bad metric value in route line: $l");
-			$r->{'metric'} = int($t);
-		} elsif ($t =~ /^(pref|scope)$/) {
-			# ignore this option
-			my $tmp;
-			($tmp, $s) = next_word($s);
-			defined $tmp or die("no value for option $t in route line: $l");
-		} else {
-			die("unsupported token '$t' in route line: $l");
+		if (defined $e->{'weight'}) {
+			$e->{'weight'} =~ /^\d+$/ or die("bad weight in route line: $l");
+			$nh->{'weight'} = int($e->{'weight'});
+			delete $e->{'weight'};
 		}
+
+		delete $e->{'flags'}; # do not parse flags
+
+		((scalar %$e) > 0) and die("unknown nexthop keys in route line: $l, unparsed: ".encode_json($e));
+
+		push @{$r->{'nexthop'}}, $nh;
 	}
+	delete $j->{'nexthops'};
 
-	$wasnh and push @{$r->{'nexthop'}}, $nh;
+	$t = $j->{'tos'} // '0x00';
+	$t =~ /^0x[0-9a-fA-F]+$/ or die("bad tos value in route line: $l");
+	$r->{'tos'} = hex($t);
+	delete $j->{'tos'};
 
-	$r->{'type'} //= 'unicast';
-	$r->{'tos'} //= 0;
-	if ($ver eq 'ipv4') {
-		$r->{'metric'} //= 0;
+	if (defined $j->{'metric'}) {
+		$r->{'metric'} = int($j->{'metric'});
+		delete $j->{'metric'};
+	} elsif ($ver eq 'ipv4') {
+		$r->{'metric'} = 0;
 	} elsif ($ver eq 'ipv6') {
-		$r->{'metric'} //= 1024;
+		$r->{'metric'} = 1024;
 	}
+
+	# ignore some attributes
+	for my $a (qw/flags pref scope/) {
+		delete $j->{$a};
+	}
+
+	(scalar (%$j) > 0) and die("unsupported key in route line: $l, unparsed: ".encode_json($j));
 
 	my $res = {};
 	$res->{'key'} = $r->{'prefix'}.' '.$r->{'metric'}.' '.$r->{'tos'};
@@ -1435,12 +1432,15 @@ sub run_get_routes {
 
 	# find routes in tables
 	foreach my $t (keys %tables) {
-		foreach my $l (ip_nofail(qw'-o -4 route show proto', $route_proto, 'table', $t)) {
+		my $j;
+		$j = decode_json(ip_nofail(qw'-j -4 route show proto', $route_proto, 'table', $t) // '[]');
+		foreach my $l (@$j) {
 			my $r = parse_route_line('ipv4', $l);
 			route_match_dev($ifdev, @{$r->{'route'}});
 			defined $r and push @{$conf->{'route'}{$t}{'ipv4'}{$r->{'key'}}}, @{$r->{'route'}};
 		}
-		foreach my $l (ip_nofail(qw'-o -6 route show proto', $route_proto, 'table', $t)) {
+		$j = decode_json(ip_nofail(qw'-j -6 route show proto', $route_proto, 'table', $t) // '[]');
+		foreach my $l (@$j) {
 			my $r = parse_route_line('ipv6', $l);
 			route_match_dev($ifdev, @{$r->{'route'}});
 			defined $r and push @{$conf->{'route'}{$t}{'ipv6'}{$r->{'key'}}}, @{$r->{'route'}};
@@ -1477,7 +1477,7 @@ sub sysctl_default {
 
 sub run_get_sysctl {
 	my ($conf) = @_;
-	foreach my $l (sysctl('-a')) {
+	foreach my $l (split(/\n/, sysctl('-a'))) {
 		$l =~ /^(?<key>\S+) = (?<val>.*)$/ or next;
 		my ($key, $val) = ($+{'key'}, $+{'val'});
 		my $def = sysctl_default($key);
@@ -1494,8 +1494,9 @@ sub run_get_qdisc {
 		defined $conf->{'iface'}{$p}{'name'} or die("no name for $p");
 		my $dev = $conf->{'iface'}{$p}{'name'};
 		my $isingress = 0;
-		foreach my $l (tc(qw'qdisc show dev', $dev)) {
-			if ($l =~ /^qdisc ingress .* ingress_block 100( |$)/) {
+		my $j = decode_json tc(qw'-j qdisc show dev', $dev);
+		foreach my $l (@$j) {
+			if ($l->{'kind'} eq 'ingress' and ($l->{'ingress_block'} // '') eq $ingress_block) {
 				$isingress = 1;
 				last;
 			}
@@ -1506,76 +1507,51 @@ sub run_get_qdisc {
 
 sub run_check_iprule {
 	my ($conf) = @_;
+	my $j;
 
-	# ipv4
-	my $no0 = 1;
-	my $is30k = 0;
-	foreach my $l (ip(qw'rule show')) {
-		if ($l =~ /^0:\s+from\s+all\s+lookup\s+local\s*$/) {
-			$no0 = 0;
-		} elsif ($l =~ /^30000:\s+from\s+all\s+lookup\s+local\s*$/) {
-			$is30k = 1;
+	for my $v (qw/4 6/) {
+		my $no0 = 1;
+		my $is30k = 0;
+		$j = decode_json ip('-j', "-$v", qw'rule show');
+		foreach my $l (@$j) {
+			if ($l->{'priority'} == 0 and $l->{'src'} eq 'all' and $l->{'table'} eq 'local') {
+				$no0 = 0;
+			} elsif ($l->{'priority'} == 30000 and $l->{'src'} eq 'all' and $l->{'table'} eq 'local') {
+				$is30k = 1;
+			}
 		}
+		my $opt = 'ip_rule_move_local';
+		($v eq '6') and $opt = 'ip6_rule_move_local';
+		$no0 and $is30k or $conf->{'global'}{$opt} = 0;
 	}
-	$no0 and $is30k or $conf->{'global'}{'ip_rule_move_local'} = 0;
-
-	# ipv6
-	$no0 = 1;
-	$is30k = 0;
-	foreach my $l (ip(qw'-6 rule show')) {
-		if ($l =~ /^0:\s+from\s+all\s+lookup\s+local\s*$/) {
-			$no0 = 0;
-		} elsif ($l =~ /^30000:\s+from\s+all\s+lookup\s+local\s*$/) {
-			$is30k = 1;
-		}
-	}
-	$no0 and $is30k or $conf->{'global'}{'ip6_rule_move_local'} = 0;
 }
 
 sub run_get_vlan {
 	my ($conf, $iplink) = @_;
 
-	my $dev;
-	my $port;
+	my $j = decode_json bridge(qw'-j vlan show');
+	foreach my $l (@$j) {
+		my $dev = $l->{'ifname'};
+		my $port;
 
-	foreach my $l (bridge(qw'vlan show')) {
-		$l =~ /^\s*port\s+vlan\s+ids\s*$/ and next;
-		if ($l eq '') {
-			$dev = undef;
-			$port = undef;
-			next;
-		}
-		if ($l =~ s/^(?<dev>\S+)\s/ /) {
-			$dev = $+{'dev'};
-			if ($dev eq $conf->{'iface'}{'switch'}{'name'}) {
-				$port = 'switch';
-			} else {
-				$port = $iplink->{$dev}{'name'};
-			}
+		if ($dev eq $conf->{'iface'}{'switch'}{'name'}) {
+			$port = 'switch';
+		} else {
+			$port = $iplink->{$dev}{'name'};
 		}
 		defined $port or next;
 
-		my $s = $l;
-		while ($s !~ /^\s*$/) {
-			my $vid;
-			($vid, $s) = next_vlan($s);
-			defined $vid or die("bad vlan line for $dev: $l");
-			my $s1 = $s;
+		foreach my $v (@{$l->{'vlans'}}) {
+			my $vid = $v->{'vlan'};
 			my $untag = 0;
+
 			my $is_pvid = 0;
 			my $is_untag = 0;
-			while (1) {
-				my $t;
-				($t, $s1) = next_word($s);
-				$t //= '';
-				if ($t =~ /^(Egress|Untagged|untagged)$/) {
+			foreach my $flag (@{$v->{'flags'} // []}) {
+				if ($flag eq "Egress Untagged") {
 					$is_untag = 1;
-					$s = $s1;
-				} elsif ($t eq 'PVID') {
+				} elsif ($flag eq 'PVID') {
 					$is_pvid = 1;
-					$s = $s1;
-				} else {
-					last;
 				}
 			}
 			if ($is_pvid and $is_untag) {
@@ -1596,55 +1572,44 @@ sub run_get_vlan {
 sub run_get_iplink_ifaces {
 	my ($iplink) = @_;
 
-	foreach my $l (ip(qw'-d -o link show')) {
+	my $j = decode_json ip(qw'-j -d link show');
+	foreach my $l (@$j) {
 		my $c = {};
-		$l =~ /^\d+: (?<name>[^\s\@:]+)(@(?<base>[^\s:]+))?: <(?<flags>[^>]+)> (?<keys>.*)$/ or die("bad interface line: $l");
-		my $iface = $+{'name'};
-		defined $+{'base'} and $+{'base'} ne 'NONE' and $c->{'base'} = $+{'base'};
-		$c->{'flags'} = ','.$+{'flags'}.',';
-		$l = $+{'keys'};
+		my $iface = $l->{'ifname'};
 
-		# first check for alias at the end
-		if ($l =~ s/\s*\\\s+alias (?<val>.*)$//) {
-			$c->{'desc'} = $+{'val'};
-		}
+		defined $l->{'link'} and $c->{'base'} = $l->{'link'};
+		defined $l->{'ifalias'} and $c->{'desc'} = $l->{'ifalias'};
 
-		$l = ' '.$l.' ';
-		$l =~ s/\\/ \\ /g;
+		$c->{'flags'} = array2set($l->{'flags'} // []);
 
-		$c->{'down'} = $c->{'flags'} =~ /,UP,/ ? 0 : 1;
-		$l =~ /\sportname\s+(?<val>\S+)\s/ and $c->{'portname'} = $+{'val'};
-		$l =~ /\sswitchid\s+(?<val>\S+)\s/ and $c->{'switchid'} = $+{'val'};
+		$c->{'down'} = ($c->{'flags'}{'UP'} // 0) ? 0 : 1;
 
-		my @a = split(/\\/, $l);
-		$l = shift @a; # first line
-		$l =~ /\smaster\s+(?<val>\S+)\s/ and $c->{'master'} = $+{'val'};
-		$l =~ /\sqdisc\s+(?<val>\S+)\s/ and $c->{'qdisc'} = $+{'val'};
-		$l =~ /\smtu\s+(?<val>\S+)\s/ and $c->{'mtu'} = $+{'val'};
-		$l = shift @a; # link/ether addr
-		$l =~ /\slink\/ether\s+(?<mac>\S+)\s/ and $c->{'mac'} = $+{'mac'};
-		foreach my $l (@a) {
-			my $t = '';
-			$l =~ /^\s*(?<val>\S+)\s/ and $t = $+{'val'};
-			if ($t =~ /_slave$/) {
-				defined $c->{'slavetype'} and die("double slave type for $iface: $t, ".$c->{'slavetype'});
-				$c->{'slavetype'} = $t;
-			} else {
-				defined $c->{'type'} and die("double type for $iface: $t, ".$c->{'type'});
-				$c->{'type'} = $t;
-			}
-			if ($t eq 'bond') {
-				$l =~ /\smode\s+(?<val>\S+)\s/ and $c->{'bond_mode'} = $+{'val'};
-				$l =~ /\sxmit_hash_policy\s+(?<val>\S+)\s/ and $c->{'bond_xmit_hash_policy'} = $+{'val'};
-				$l =~ /\smin_links\s+(?<val>\S+)\s/ and $c->{'bond_min_links'} = $+{'val'};
-				$l =~ /\slacp_rate\s+(?<val>\S+)\s/ and $c->{'bond_lacp_rate'} = $+{'val'};
-			} elsif ($t eq 'bridge') {
-				$l =~ /\svlan_filtering\s+(?<val>\S+)\s/ and $c->{'bridge_vlan_filtering'} = $+{'val'};
-			} elsif ($t eq 'vrf') {
-				$l =~ /\stable\s+(?<val>\S+)\s/ and $c->{'vrf_table'} = $+{'val'};
-			} elsif ($t eq 'vlan') {
-				$l =~ /\sid\s+(?<val>\S+)\s/ and $c->{'vlan_id'} = $+{'val'};
-			}
+		defined $l->{'phys_port_name'} and $c->{'portname'} = $l->{'phys_port_name'};
+		defined $l->{'phys_switch_id'} and $c->{'switchid'} = $l->{'phys_switch_id'};
+
+		defined $l->{'master'} and $c->{'master'} = $l->{'master'};
+		defined $l->{'qdisc'} and $c->{'qdisc'} = $l->{'qdisc'};
+		defined $l->{'mtu'} and $c->{'mtu'} = $l->{'mtu'};
+
+		$l->{'link_type'} eq 'ether' and $c->{'mac'} = $l->{'address'};
+
+		my $i = $l->{'linkinfo'} // {};
+
+		defined $i->{'info_slave_kind'} and $c->{'slavetype'} = $i->{'info_slave_kind'};
+		defined $i->{'info_kind'} and $c->{'type'} = $i->{'info_kind'};
+
+		my $t = $c->{'type'} // '';
+		if ($t eq 'bond') {
+			$c->{'bond_mode'} = $i->{'info_data'}{'mode'};
+			$c->{'bond_xmit_hash_policy'} = $i->{'info_data'}{'xmit_hash_policy'};
+			$c->{'bond_min_links'} = $i->{'info_data'}{'min_links'};
+			$c->{'bond_lacp_rate'} = $i->{'info_data'}{'ad_lacp_rate'};
+		} elsif ($t eq 'bridge') {
+			$c->{'bridge_vlan_filtering'} = $i->{'info_data'}{'vlan_filtering'};
+		} elsif ($t eq 'vrf') {
+			$c->{'vrf_table'} = $i->{'info_data'}{'table'};
+		} elsif ($t eq 'vlan') {
+			$c->{'vlan_id'} = $i->{'info_data'}{'id'};
 		}
 
 		defined $c->{'mac'} and $c->{'addr_assign_type'} = read_file("/sys/class/net/$iface/addr_assign_type");
@@ -1656,27 +1621,31 @@ sub run_get_iplink_ifaces {
 sub run_get_iplink_addrs {
 	my ($iplink) = @_;
 
-	foreach my $l (ip(qw'-o addr show')) {
+	my $j = decode_json ip(qw'-j addr show');
+	foreach my $l (@$j) {
 		my $c = {};
-		$l =~ /^\d+: (?<name>[^\s\@:]+)\s+(?<family>\S+)\s+(?<ip>\S+)\s/ or die("bad address line: $l");
-		my ($iface, $ip, $f) = ($+{'name'}, $+{'ip'}, $+{'family'});
-		if ($f eq 'inet') {
-			$f = 'ipv4';
-			$ip = parse_prefix4($ip);
-		} elsif ($f eq 'inet6') {
-			$f = 'ipv6';
-			$ip = parse_prefix6($ip);
-			my $addr = $ip;
-			$addr =~ s!/\d+$!!;
-			# skip link-local address if nodad is not set
-			# nodad flag is set on managed link-local addresses
-			if (find_ip_net6($addr, @ipv6_linklocal)) {
-				$l =~ / nodad / or next;
+		my $iface = $l->{'ifname'};
+		foreach my $a (@{$l->{'addr_info'}}) {
+			my $ip = $a->{'local'}.'/'.$a->{'prefixlen'};
+			my $f = $a->{'family'};
+			if ($f eq 'inet') {
+				$f = 'ipv4';
+				$ip = parse_prefix4($ip);
+			} elsif ($f eq 'inet6') {
+				$f = 'ipv6';
+				$ip = parse_prefix6($ip);
+				my $addr = $ip;
+				$addr =~ s!/\d+$!!;
+				# skip link-local address if nodad is not set
+				# nodad flag is set on managed link-local addresses
+				if (find_ip_net6($addr, @ipv6_linklocal)) {
+					($a->{'nodad'} // 0) or next;
+				}
+			} else {
+				next;
 			}
-		} else {
-			next;
+			$iplink->{$iface}{'addr'}{$f}{$ip} = 1;
 		}
-		$iplink->{$iface}{'addr'}{$f}{$ip} = 1;
 	}
 }
 
@@ -2621,7 +2590,7 @@ sub update_config {
 		my $nq = ($newc->{'iface'}{$iface}{'qdisc'}{'ingress'} // 1);
 		$rq == $nq and next;
 		if ($nq) {
-			tc(qw'qdisc add dev', $dev, qw'ingress_block 100 ingress');
+			tc(qw'qdisc add dev', $dev, qw'ingress_block', $ingress_block, 'ingress');
 			delete $runc->{'iface'}{$iface}{'qdisc'}{'ingress'};
 		} else {
 			tc(qw'qdisc del dev', $dev, 'ingress');
