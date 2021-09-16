@@ -2486,11 +2486,10 @@ sub update_config {
 	my $togetport = 0;
 	foreach my $p (sort keys %$todel) {
 		# port subinterface 0 should exist
-		my $dl = $runc->{'iface'}{"$p/0"}{'devlink'};
 		my $dev = $runc->{'iface'}{"$p/0"}{'name'};
-		defined $dl and defined $dev or die("oops $p/0 does not exist to unsplit");
+		defined $dev or die("oops $p/0 does not exist to unsplit");
 
-		devlink(qw'port unsplit', $dl);
+		devlink(qw'port unsplit', $dev);
 		# always reread ports
 		$togetport = 1;
 
@@ -2512,7 +2511,6 @@ sub update_config {
 		# add stub device info in read-only mode
 		if (not $_write_mode) {
 			$runc->{'iface'}{$p}{'name'} = '<'.iface2dev($p).'>';
-			$runc->{'iface'}{$p}{'devlink'} = '<unknown>';
 			push @_show_err, "missing link info for $p after unsplit";
 		}
 	}
@@ -2526,12 +2524,11 @@ sub update_config {
 	}
 	# then split
 	foreach my $p (sort keys %$toadd) {
-		my $dl = $runc->{'iface'}{$p}{'devlink'};
 		my $dev = $runc->{'iface'}{$p}{'name'};
-		(defined $dl and defined $dev) or die("oops split: missing link info for $p");
+		defined $dev or die("oops split: missing link info for $p");
 		my $n = $newc->{'split'}{$p};
 		
-		devlink(qw'port split', $dl, 'count', $n);
+		devlink(qw'port split', $dev, 'count', $n);
 		# always reread ports
 		$togetport = 1;
 
@@ -2549,7 +2546,6 @@ sub update_config {
 			# add stub device info in read-only mode
 			if (not $_write_mode) {
 				$runc->{'iface'}{"$p/$x"}{'name'} = '<'.iface2dev("$p/$x").'>';
-				$runc->{'iface'}{"$p/$x"}{'devlink'} = '<unknown>';
 			}
 		}
 
