@@ -9,6 +9,7 @@ no autovivification;
 use Storable qw(dclone);
 use File::Basename qw(dirname);
 use JSON::PP;
+use Time::HiRes qw(sleep);
 
 my $_write_mode = 0;
 my @_show_err = ();
@@ -2514,6 +2515,7 @@ sub update_config {
 	# reread ports if we unsplit them
 	if ($togetport and $_write_mode) {
 		my $iplink = {};
+		sleep(0.2); # give udev some grace time to rename new interfaces
 		run_get_iplink_ifaces($iplink);
 		run_port_names($runc, $iplink);
 		run_macs($runc, $iplink);
@@ -2554,6 +2556,7 @@ sub update_config {
 	# reread ports if we split them
 	if ($togetport and $_write_mode) {
 		my $iplink = {};
+		sleep(0.2); # give udev some grace time to rename new interfaces
 		run_get_iplink_ifaces($iplink);
 		run_port_names($runc, $iplink);
 		run_macs($runc, $iplink);
