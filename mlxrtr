@@ -545,6 +545,12 @@ sub next_iface {
 	return ($port, $t, $s);
 }
 
+sub is_allowed_table {
+	my ($t) = @_;
+	$t > 0 and $t < (2**32) and not ($t >= 253 and $t <= 255) and return 1;
+	return 0;
+}
+
 sub glob_files {
 	my ($s) = @_;
 	if ($s =~ m!^/!) {
@@ -907,7 +913,7 @@ sub parse_vrf_section {
 	$op //= '';
 	if ($op eq 'table') {
 		($op, $s) = next_uint($s);
-		$s eq '' and defined $op and $op > 0 and $op < 253 or die("bad table directive: $l");
+		$s eq '' and defined $op and is_allowed_table($op) or die("bad table directive: $l");
 		$conf->{'vrf'}{$iface}{'table'} = $op;
 		return 1;
 	} elsif ($op eq 'route') {
@@ -1186,7 +1192,7 @@ sub read_config {
 	foreach my $vrf (keys %{$conf->{'vrf'}}) {
 		defined $conf->{'vrf'}{$vrf}{'table'} or die("table is not defined for $vrf");
 		my $t = $conf->{'vrf'}{$vrf}{'table'};
-		$t > 0 and $t < 253 or die("bad table number $t for $vrf");
+		is_allowed_table($t) or die("bad table number $t for $vrf");
 		defined $conf->{'route'}{$t} and die("table $t for $vrf is alredy defined");
 		$conf->{'route'}{$t} = $conf->{'vrf'}{$vrf}{'route_tmp'} // {};
 		delete $conf->{'vrf'}{$vrf}{'route_tmp'};
