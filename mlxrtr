@@ -1257,34 +1257,31 @@ sub run_port_names {
 
 	my %maxsplit = ();
 
-	# find interface names and split
-	my $j = decode_json devlink(qw'-j port show');
-	foreach my $devlink (keys %{$j->{'port'}}) {
-		my $l = $j->{'port'}{$devlink};
-		my $lt = $l->{'type'};
-		$lt eq 'eth' and $l->{'flavour'} eq 'physical' or next;
-		my $name = $l->{'netdev'};
-		my $split = $l->{'split_group'} // '';
-		defined $iplink->{$name} or die("devlink for $name exists, but $name is missing in iplink");
+	# find port interfaces and splits
+	foreach my $name (keys %$iplink) {
+		# we need only switch interfaces
+		defined $iplink->{$name}{'switchid'} or next;
+
 		defined $iplink->{$name}{'portname'} or die("missing portname for $name in iplink");
 		my $portname = $iplink->{$name}{'portname'};
 		$portname =~ /^p(?<num>\d+)(s(?<sub>\d+))?$/ or die("bad portname $portname for $name in iplink");
 		my ($num, $sub) = ($+{'num'}, $+{'sub'} // '');
 
 		my $base = "port $num";
-		my $p = $base.($sub eq '' ? '' : '/'.$sub);
-		if ($split eq '') {
-			$sub eq '' or die("oops subport $portname without split_group");
+		my $p = $base;
+		if ($sub eq '') {
 			delete $conf->{'split'}{$p};
 		} else {
-			$sub ne '' or die("oops port $portname with split_group");
+			$p .= "/$sub";
 			$maxsplit{$base} = max($sub + 1, $maxsplit{$base} // 0);
 		}
+
 		# check if "port" name is used that it is correct
 		if ($name =~ /^port/) {
 			$name eq iface2dev($p) or die("bad port name: $name for $p");
 		}
- 		$conf->{'iface'}{$p}{'devlink'} = $devlink;
+
+		$conf->{'iface'}{$p}{'switchid'} = $iplink->{$name}{'switchid'};
 		$conf->{'iface'}{$p}{'name'} = $name;
 	}
 
@@ -1659,7 +1656,7 @@ sub get_port_list {
 	my ($conf) = @_;
 	my @a = ();
 	foreach my $p (keys %{$conf->{'iface'}}) {
-		defined $conf->{'iface'}{$p}{'devlink'} or next;
+		defined $conf->{'iface'}{$p}{'switchid'} or next;
 		my $name = $conf->{'iface'}{$p}{'name'};
 		push @a, $name;
 	}
@@ -1685,7 +1682,7 @@ sub run_get_config {
 	run_get_iplink_ifaces($iplink);
 	run_get_iplink_addrs($iplink);
 
-	# get port names, devlink handle and split number
+	# get port names and split number
 	run_port_names($conf, $iplink);
 
 	# fill list with interfaces falling under our pattern
@@ -1716,10 +1713,9 @@ sub run_get_config {
 		}
 
 		# check if port
-		if (defined $iface->{'portname'}) {
+		if (defined $iface->{'switchid'}) {
 			$iface->{'portname'} =~ /^p(?<num>\d+)(s(?<sub>\d+))?$/ or die("bad port name for $name: ".$iface->{'portname'});
 			$port = 'port '.int($+{'num'}).(defined $+{'sub'} ? '/'.$+{'sub'} : '');
-			$conf->{'iface'}{$port}{'name'} eq $name or die("oops port name mistmatch ip link ($name) vs devlink (".$conf->{'iface'}{$port}{'name'}.")");
 		} elsif (($iface->{'type'} // '') eq 'dummy') {
 			$port =~ /^loopback / or $port = "raw $name";
 		} elsif (($iface->{'type'} // '') eq 'bond') {
@@ -2511,6 +2507,7 @@ sub update_config {
 		# add stub device info in read-only mode
 		if (not $_write_mode) {
 			$runc->{'iface'}{$p}{'name'} = '<'.iface2dev($p).'>';
+			$runc->{'iface'}{$p}{'switchid'} = '<unknown>';
 			push @_show_err, "missing link info for $p after unsplit";
 		}
 	}
@@ -2546,6 +2543,7 @@ sub update_config {
 			# add stub device info in read-only mode
 			if (not $_write_mode) {
 				$runc->{'iface'}{"$p/$x"}{'name'} = '<'.iface2dev("$p/$x").'>';
+				$runc->{'iface'}{"$p/$x"}{'switchid'} = '<unknown>';
 			}
 		}
 
