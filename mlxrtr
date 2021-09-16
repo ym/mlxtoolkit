@@ -8,7 +8,7 @@ no autovivification;
 
 use Storable qw(dclone);
 use File::Basename qw(dirname);
-use JSON::PP;
+use JSON::PP qw(decode_json encode_json);
 use Time::HiRes qw(sleep);
 
 my $_write_mode = 0;
