@@ -700,6 +700,11 @@ sub parse_config {
 			die("ip_proto icmp is not supported with ipv6 in: $l");
 		}
 
+		# fail if port is defined with bad proto or without it
+		if ((defined $keys{'src_port'} or defined $keys{'dst_port'}) and not (($keys{'ip_proto'} // '') =~ /^udp|tcp$/)) {
+			die("port can only be set with tcp or udp ip_proto in: $l");
+		}
+
 		push(@{$chain{$curchain}{'rule'}}, {
 			'action' => $action,
 			'proto' => $proto,
