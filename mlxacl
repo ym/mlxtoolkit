@@ -1,11 +1,16 @@
 #!/usr/bin/perl -w
 
 my $ingress_block = 100;
+my $conf_skipsw = 1;
 
 use Storable qw(dclone);
 use JSON::PP;
 
 my $_write_mode = 0;
+
+my %_conf_rule = (
+	'skip_sw' => $conf_skipsw,
+);
 
 if ($ENV{'PATH'} !~ m!^/root/bin:!) {
 	$ENV{'PATH'} = '/root/bin:'.$ENV{'PATH'};
@@ -291,6 +296,23 @@ sub tc_replace {
 sub tc_del_chain {
 	my ($ch) = @_;
 	return tc(qw'filter del block', $ingress_block, 'chain', $ch);
+}
+
+sub rule_add {
+	my ($c, $pref, $r) = @_;
+	my @s = ('protocol', $r->{'proto'});
+	if ($r->{'skip_sw'} // 0) {
+		push(@s, 'skip_sw');
+	}
+	foreach my $k (sort { $keyprio{$a} <=> $keyprio{$b} } keys %{$r->{'keys'}}) {
+		push(@s, $k, $r->{'keys'}{$k});
+	}
+	if ($r->{'action'} =~ /^goto (?<goto>.*)$/) {
+		push(@s, qw'action goto chain', $+{'goto'});
+	} else {
+		push(@s, 'action', $r->{'action'});
+	}
+	tc_add($c, $pref, @s);
 }
 
 sub run_ports_get {
@@ -710,7 +732,7 @@ sub parse_config {
 			'action' => $action,
 			'proto' => $proto,
 			'keys' => \%keys,
-			'skip_sw' => 1,
+			%_conf_rule,
 		});
 	}
 
@@ -738,7 +760,7 @@ sub parse_config {
 			'proto' => 'ip',
 			#'keys' => { 'eth_type' => 'ipv4' },
 			'keys' => {},
-			'skip_sw' => 1,
+			%_conf_rule,
 		});
 	}
 	# ipv6
@@ -764,7 +786,7 @@ sub parse_config {
 			'proto' => 'ipv6',
 			#'keys' => { 'eth_type' => 'ipv6' },
 			'keys' => {},
-			'skip_sw' => 1,
+			%_conf_rule,
 		});
 	}
 
@@ -1051,19 +1073,7 @@ foreach my $c (reverse @{ sort_topo($newchain) }) {
 	my $pref = 0;
 	foreach my $r (@$rule) {
 		++$pref;
-		my @s = ('protocol', $r->{'proto'});
-		if ($r->{'skip_sw'} // 0) {
-			push(@s, 'skip_sw');
-		}
-		foreach my $k (sort { $keyprio{$a} <=> $keyprio{$b} } keys %{$r->{'keys'}}) {
-			push(@s, $k, $r->{'keys'}{$k});
-		}
-		if ($r->{'action'} =~ /^goto (?<goto>.*)$/) {
-			push(@s, qw'action goto chain', $+{'goto'});
-		} else {
-			push(@s, 'action', $r->{'action'});
-		}
-		tc_add($c, $pref, @s);
+		rule_add($c, $pref, $r);
 	}
 }
 
@@ -1099,7 +1109,12 @@ if (not cmp_generic($runconf->{'vlan'}, $newconf->{'vlan'})) {
 		}
 		$ready and next;
 
-		tc_add(0, $num, qw'skip_sw vlan_id', $vl, qw'action goto chain', $newch);
+		rule_add(0, $num, {
+			'proto' => '802.1q',
+			'keys' => { 'vlan_id' => $vl },
+			'action' => "goto $newch",
+			%_conf_rule,
+		});
 	}
 
 	# new vlan rules are added, add pass rule if needed
@@ -1107,18 +1122,34 @@ if (not cmp_generic($runconf->{'vlan'}, $newconf->{'vlan'})) {
 	if ($afterpass) {
 		# if we used pref number greater than old pass, add a new one
 		defined $runvlanpref->{"$num"} and die("old rules is not possible in chain 0 after pass rule: pref $num");
-		tc_add(0, $num, qw'skip_sw action pass');
+		rule_add(0, $num, {
+			'proto' => '802.1q',
+			'keys' => {},
+			'action' => 'pass',
+			%_conf_rule,
+		});
 	} elsif (defined $runvlanpref->{"$num"}) {
 		if ($runvlanpref->{"$num"} eq 'pass') {
 			# there is already pass rule here
 			delete $runvlanpref->{"$num"};
 		} else {
 			# replace some other rule with pass rule
-			tc_replace(0, $num, qw'action pass');
+			tc_del(0, $num);
+			rule_add(0, $num, {
+				'proto' => '802.1q',
+				'keys' => {},
+				'action' => 'pass',
+				%_conf_rule,
+			});
 			delete $runvlanpref->{"$num"};
 		}
 	} else {
-		tc_add(0, $num, qw'skip_sw action pass');
+		rule_add(0, $num, {
+			'proto' => '802.1q',
+			'keys' => {},
+			'action' => 'pass',
+			%_conf_rule,
+		});
 	}
 
 	# delete any old rules left
