@@ -2,6 +2,7 @@
 
 my $ingress_block = 100;
 my $conf_skipsw = 1;
+my $conf_hwstats = 0;
 
 use Storable qw(dclone);
 use JSON::PP;
@@ -10,6 +11,7 @@ my $_write_mode = 0;
 
 my %_conf_rule = (
 	'skip_sw' => $conf_skipsw,
+	'hw_stats' => $conf_hwstats,
 );
 
 if ($ENV{'PATH'} !~ m!^/root/bin:!) {
@@ -312,6 +314,9 @@ sub rule_add {
 	} else {
 		push(@s, 'action', $r->{'action'});
 	}
+	if (not ($r->{'hw_stats'} // 0)) {
+		push(@s, qw'hw_stats disabled');
+	}
 	tc_add($c, $pref, @s);
 }
 
@@ -400,26 +405,31 @@ sub run_chains_get {
 
 		# Filter actions
 
+		my $hwstats = 1; # not disabled if missing
+
 		foreach my $a (@{$o->{'actions'}}) {
 			$a->{'order'} eq '1' and $a->{'kind'} eq 'gact' or die("Unsupported action line: ".encode_json($l));
 			my $act = $a->{'control_action'}{'type'};
 			if ($act =~ /^(drop|pass)$/) {
 				$rule{'action'} = $act;
-				next;
 			} elsif ($act eq 'goto') {
 				my $goto = $a->{'control_action'}{'chain'};
 				# internal representation without "chain" word
 				$rule{'action'} = "goto $goto";
 				$chains{$rule{'chain'}}{'refers'}{$goto} = 1;
 				$chains{$goto}{'referedby'}{$rule{'chain'}} = 1;
-				next;
 			} else {
 				die("Unsupported action: ".encode_json($l));
+			}
+
+			if (cmp_generic($a->{'hw_stats'} // [], ['disabled'])) {
+				$hwstats = 0;
 			}
 		}
 
 		$rule{'in_hw'} = $o->{'in_hw'} // 0;
 		$rule{'skip_sw'} = int($o->{'skip_sw'} // 0);
+		$rule{'hw_stats'} = $hwstats;
 
 		# Remember rule
 
@@ -438,6 +448,7 @@ sub run_chains_get {
 				'keys' => $rule{'keys'} // {},
 				'action' => $rule{'action'},
 				'skip_sw' => $rule{'skip_sw'},
+				'hw_stats' => $rule{'hw_stats'},
 			};
 		}
 	}
