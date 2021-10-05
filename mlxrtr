@@ -522,7 +522,7 @@ sub next_iface {
 	($n // '') eq '' and die("Can not parse interface name in: $s0");
 
 	my $port;
-	if ($t =~ /^(bond|loopback|vrf)$/) { 
+	if ($t =~ /^(bond|loopback|vrf)$/) {
 		$n = check_name($n);
 		defined $n or die("No valid name for interface type $t in: $s0");
 		$port = iface_with_type($t, $n);
@@ -686,7 +686,7 @@ sub parse_ip_option {
 			($w, $s) = next_token($s);
 		}
 		defined $w and $w eq '' and $s eq '' or die("bad ip list: $l");
-		
+
 		return 1;
 	} else {
 		return 0;
@@ -1240,7 +1240,7 @@ sub read_config {
 			$conf->{'iface'}{$sub} //= { 'down' => 1 };
 		}
 	}
-	
+
 	# set bond default configuration
 	foreach my $p (keys %{$conf->{'bond'}}) {
 		my $b = $conf->{'bond'}{$p};
@@ -1617,7 +1617,7 @@ sub run_get_iplink_ifaces {
 		}
 
 		defined $c->{'mac'} and $c->{'addr_assign_type'} = read_file("/sys/class/net/$iface/addr_assign_type");
-		
+
 		$iplink->{$iface} = $c;
 	}
 }
@@ -2526,7 +2526,7 @@ sub update_config {
 		my $dev = $runc->{'iface'}{$p}{'name'};
 		defined $dev or die("oops split: missing link info for $p");
 		my $n = $newc->{'split'}{$p};
-		
+
 		devlink(qw'port split', $dev, 'count', $n);
 		# always reread ports
 		$togetport = 1;
@@ -2762,7 +2762,7 @@ sub update_config {
 			vlan_add($runc, $iface, $id, 1);
 		}
 	}
-	
+
 	# update descriptions (aliases)
 	# all interfaces should be created now
 	foreach my $iface (sort keys %{$runc->{'iface'}}) {
