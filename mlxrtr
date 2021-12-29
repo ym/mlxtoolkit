@@ -1739,7 +1739,7 @@ sub run_get_config {
 		}
 
 		# check switch name for master bridges
-		if (($iface->{'slavetype'} //= '') eq 'bridge_slave') {
+		if (($iface->{'slavetype'} //= '') eq 'bridge') {
 			$ifsw //= $iface->{'master'};
 			# if multiple bridge interfaces
 			$ifsw ne $iface->{'master'} and $ifsw = '';
