@@ -1497,15 +1497,15 @@ sub run_get_qdisc {
 		$p =~ /^port / or next;
 		defined $conf->{'iface'}{$p}{'name'} or die("no name for $p");
 		my $dev = $conf->{'iface'}{$p}{'name'};
-		my $isingress = 0;
+		my $ingress = 0;
 		my $j = decode_json tc(qw'-j qdisc show dev', $dev);
 		foreach my $l (@$j) {
-			if ($l->{'kind'} eq 'ingress' and ($l->{'ingress_block'} // '') eq $ingress_block) {
-				$isingress = 1;
+			if ($l->{'kind'} eq 'ingress') {
+				$ingress = $l->{'ingress_block'} // 0;
 				last;
 			}
 		}
-		$isingress or $conf->{'iface'}{$p}{'qdisc'}{'ingress'} = 0;
+		$conf->{'iface'}{$p}{'qdisc'}{'ingress'} = $ingress;
 	}
 }
 
@@ -2589,14 +2589,15 @@ sub update_config {
 	foreach my $iface (sort keys %{$runc->{'iface'}}) {
 		$iface =~ /^port / or next;
 		my $dev = conf_ifdev($runc, $iface);
-		my $rq = ($runc->{'iface'}{$iface}{'qdisc'}{'ingress'} // 1);
-		my $nq = ($newc->{'iface'}{$iface}{'qdisc'}{'ingress'} // 1);
+		my $rq = $runc->{'iface'}{$iface}{'qdisc'}{'ingress'} // $ingress_block;
+		my $nq = $newc->{'iface'}{$iface}{'qdisc'}{'ingress'} // $ingress_block;
 		$rq == $nq and next;
-		if ($nq) {
-			tc(qw'qdisc add dev', $dev, qw'ingress_block', $ingress_block, 'ingress');
-			delete $runc->{'iface'}{$iface}{'qdisc'}{'ingress'};
-		} else {
+		if ($rq) {
 			tc(qw'qdisc del dev', $dev, 'ingress');
+			delete $runc->{'iface'}{$iface}{'qdisc'}{'ingress'};
+		}
+		if ($nq) {
+			tc(qw'qdisc add dev', $dev, 'ingress_block', $nq, 'ingress');
 			$runc->{'iface'}{$iface}{'qdisc'}{'ingress'} = $nq;
 		}
 	}
