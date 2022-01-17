@@ -305,6 +305,11 @@ sub run_tool {
 	return run_tool_ext('bin' => $bin, 'opt' => \@a);
 }
 
+sub wait_ifaces {
+	#sleep(0.2); # alternative: give udev some grace time to rename ifaces
+	return run_tool_ext('bin' => 'udevadm', 'opt' => [qw'settle -t 60'], 'nofail' => 1);
+}
+
 sub ip {
 	return run_tool('ip', @_);
 }
@@ -2513,12 +2518,14 @@ sub update_config {
 		}
 	}
 	# reread ports if we unsplit them
-	if ($togetport and $_write_mode) {
-		my $iplink = {};
-		sleep(0.2); # give udev some grace time to rename new interfaces
-		run_get_iplink_ifaces($iplink);
-		run_port_names($runc, $iplink);
-		run_macs($runc, $iplink);
+	if ($togetport) {
+		wait_ifaces(); # give udev time to rename new interfaces
+		if ($_write_mode) {
+			my $iplink = {};
+			run_get_iplink_ifaces($iplink);
+			run_port_names($runc, $iplink);
+			run_macs($runc, $iplink);
+		}
 	        $togetport = 0;
 	}
 	# then split
@@ -2554,12 +2561,14 @@ sub update_config {
 		}
 	}
 	# reread ports if we split them
-	if ($togetport and $_write_mode) {
-		my $iplink = {};
-		sleep(0.2); # give udev some grace time to rename new interfaces
-		run_get_iplink_ifaces($iplink);
-		run_port_names($runc, $iplink);
-		run_macs($runc, $iplink);
+	if ($togetport) {
+		wait_ifaces(); # give udev time to rename new interfaces
+		if ($_write_mode) {
+			my $iplink = {};
+			run_get_iplink_ifaces($iplink);
+			run_port_names($runc, $iplink);
+			run_macs($runc, $iplink);
+		}
 	        $togetport = 0;
 	}
 
