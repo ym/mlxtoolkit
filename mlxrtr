@@ -13,6 +13,7 @@ use Time::HiRes qw(sleep);
 
 my $_write_mode = 0;
 my @_show_err = ();
+my @_show_info = ();
 
 my $max_ifname_len = 15;
 
@@ -2725,10 +2726,18 @@ sub update_config {
 		my $dev = conf_ifdev($runc, $iface);
 		if (($runc->{'iface'}{$iface}{'addr_assign_type'} // '0') ne '3') {
 			$runc->{'iface'}{$iface}{'mac'} //= '<unknown>';
-			if (not $_write_mode and $runc->{'iface'}{$iface}{'mac'} eq '<unknown>') {
-				push @_show_err, "missing mac info for new iface $iface";
+			if ($runc->{'iface'}{$iface}{'mac'} eq '<unknown>') {
+				$_write_mode and die('oops unknown mac for: '.$dev);
+				my $qdev = shell_quote($dev);
+				run_tool_ext(
+					'noquote' => 1,
+					'bin' => 'ip',
+					'opt' => [qw'link set dev', $qdev, 'address', "\$(cat /sys/class/net/${qdev}/address)"],
+				);
+				push @_show_info, "substituted mac value for new iface $iface";
+			} else {
+				ip(qw'link set dev', $dev, 'address', $runc->{'iface'}{$iface}{'mac'});
 			}
-			ip(qw'link set dev', $dev, 'address', $runc->{'iface'}{$iface}{'mac'});
 			$runc->{'iface'}{$iface}{'addr_assign_type'} = '3';
 		}
 	}
@@ -2933,6 +2942,9 @@ my $newconf = read_config();
 my $runconf = run_get_config([map { $newconf->{'vrf'}{$_}{'table'} } keys %{$newconf->{'vrf'}}]);
 
 update_config($runconf, $newconf);
+if (scalar @_show_info > 0) {
+	print join('', map { s/^(.*)$/# info: $1\n/; $_; } @_show_info);
+}
 if (scalar @_show_err > 0) {
 	print join('', map { s/^(.*)$/# warning: $1\n/; $_; } @_show_err);
 	exit(1);
