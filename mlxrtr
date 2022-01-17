@@ -20,12 +20,18 @@ my $our_iface = qr/port\S+|bond\S+|switch|vlan\S+|vrf\S+|lo\S+/;
 my @ipv6_linklocal = qw( fe80::/10 );
 my $route_proto = 'static';
 
+# whether ports are renamed with udev
+my $_iface_port = 0;
+
 my $_curfilehandle;
 my $_curfilename;
 
 if ($ENV{'PATH'} !~ m!^/root/bin:!) {
 	$ENV{'PATH'} = '/root/bin:'.$ENV{'PATH'};
 }
+
+# check if we rename ports by udev
+-e '/etc/udev/rules.d/70-net-mlxtoolkit.rules' and $_iface_port = 1;
 
 sub max {
 	my $m;
@@ -2512,9 +2518,10 @@ sub update_config {
 
 		# add stub device info in read-only mode
 		if (not $_write_mode) {
-			$runc->{'iface'}{$p}{'name'} = '<'.iface2dev($p).'>';
+			my $d = iface2dev($p);
+			$runc->{'iface'}{$p}{'name'} = $_iface_port ? $d : "<$d>";
 			$runc->{'iface'}{$p}{'switchid'} = '<unknown>';
-			push @_show_err, "missing link info for $p after unsplit";
+			$_iface_port or push @_show_err, "missing link info for $p after unsplit";
 		}
 	}
 	# reread ports if we unsplit them
@@ -2551,12 +2558,13 @@ sub update_config {
 
 			# add stub device info in read-only mode
 			if (not $_write_mode) {
-				$runc->{'iface'}{"$p/$x"}{'name'} = '<'.iface2dev("$p/$x").'>';
+				my $d = iface2dev("$p/$x");
+				$runc->{'iface'}{"$p/$x"}{'name'} = $_iface_port ? $d : "<$d>";
 				$runc->{'iface'}{"$p/$x"}{'switchid'} = '<unknown>';
 			}
 		}
 
-		if (not $_write_mode) {
+		if (not $_write_mode and not $_iface_port) {
 			push @_show_err, "missing link info for $p after split";
 		}
 	}
