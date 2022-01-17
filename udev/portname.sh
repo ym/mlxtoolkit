@@ -6,4 +6,4 @@ EOF
 	exit $?
 fi
 exec 2>/dev/null # ignore missing phys_port_name
-sed 's/^p\([0-9]+\)/port\1/;s/s\([0-9]+\)$/-\1/' </sys/"$DEVPATH"/phys_port_name
+sed 's/^p\([0-9]\+\)/port\1/;s/s\([0-9]\+\)$/-\1/' </sys/"$DEVPATH"/phys_port_name
