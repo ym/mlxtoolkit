@@ -272,8 +272,14 @@ sub run_tool_ext {
 	my $bin = $h{'bin'};
 	my @a = @{$h{'opt'}};
 	my $nofail = $h{'nofail'} // 0;
+	my $noquote = $h{'noquote'} // 0;
 	my $quieterr = $nofail;
-	my $opt = join(' ', mapf(\&shell_quote, @a));
+	my $opt;
+	if ($noquote) {
+		$opt = join(' ', @a);
+	} else {
+		$opt = join(' ', mapf(\&shell_quote, @a));
+	}
 	my $tool = $bin;
 	$tool =~ s!.*/!!; # tool name only
 	my $rocmd = 0;
