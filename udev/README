@@ -1,0 +1,5 @@
+To install a udev rule to rename ports with udev:
+./portname.sh install
+
+The rule is installed in this location:
+/etc/udev/rules.d/70-net-mlxtoolkit.rules
