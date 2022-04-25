@@ -410,7 +410,7 @@ sub run_chains_get {
 		foreach my $a (@{$o->{'actions'}}) {
 			$a->{'order'} eq '1' and $a->{'kind'} eq 'gact' or die("Unsupported action line: ".encode_json($l));
 			my $act = $a->{'control_action'}{'type'};
-			if ($act =~ /^(drop|pass)$/) {
+			if ($act =~ /^(drop|pass|trap)$/) {
 				$rule{'action'} = $act;
 			} elsif ($act eq 'goto') {
 				my $goto = $a->{'control_action'}{'chain'};
@@ -680,7 +680,7 @@ sub parse_config {
 				defined $action and die("Action is defined twice in: $l");
 				($w, $t) = next_word($t);
 
-				if ($w =~ /^(drop|pass)$/) {
+				if ($w =~ /^(drop|pass|trap)$/) {
 					$action = $w;
 				} elsif ($w eq 'goto') {
 					($w, $t) = next_word($t);

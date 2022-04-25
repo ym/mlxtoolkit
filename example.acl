@@ -18,6 +18,7 @@
 # actions are:
 #   action pass
 #   action drop
+#   action trap
 #   action goto [chain] # brackets are part of the syntax
 dst_ip 10.0.0.0/8 action drop
 action pass src_ip 192.168.0.1 # order of keys and action is not important
